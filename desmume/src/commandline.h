@@ -86,6 +86,7 @@ public:
 	int arm9_gdb_port;
 	int arm7_gdb_port;
 	int start_paused;
+	int enable_mcp;  /* 1 = run as MCP server over stdio (headless debug) */
 	std::string cflash_image;
 	std::string cflash_path;
 	std::string gbaslot_rom;

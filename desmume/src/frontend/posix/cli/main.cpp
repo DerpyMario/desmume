@@ -47,6 +47,10 @@
 #include "../commandline.h"
 #include "../slot2.h"
 #include "../utils/xstring.h"
+#ifdef HAVE_MCP
+#include "../mcp/mcp_server.h"
+#include <sys/select.h>
+#endif
 
 #ifdef GDB_STUB
 #include "../armcpu.h"
@@ -478,6 +482,70 @@ int main(int argc, char ** argv) {
   }
 
   backup_setManualBackupType(my_config.savetype);
+
+#ifdef HAVE_MCP
+  if (my_config.enable_mcp) {
+    /* MCP mode: headless, stdio JSON-RPC. ROM optional (can load via nds_load_rom tool). */
+    if (!my_config.nds_file.empty()) {
+      error = NDS_LoadROM(my_config.nds_file.c_str());
+      if (error < 0) {
+        fprintf(stderr, "error while loading %s\n", my_config.nds_file.c_str());
+        exit(-1);
+      }
+    }
+    execute = my_config.start_paused ? false : true;
+
+    static void set_execute_cb(int run) { execute = (run != 0); }
+    static int get_execute_cb(void) { return execute ? 1 : 0; }
+    mcp_server_init(set_execute_cb, get_execute_cb);
+
+    static char mcp_line_buf[65536];
+    static size_t mcp_line_len = 0;
+
+    for (;;) {
+      fd_set rfd;
+      struct timeval tv;
+      FD_ZERO(&rfd);
+      FD_SET(0, &rfd);
+      if (execute) {
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+      } else {
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+      }
+      int r = select(1, &rfd, NULL, NULL, &tv);
+      if (r > 0 && FD_ISSET(0, &rfd)) {
+        int c = getchar();
+        if (c == EOF) break;
+        if (c == '\n' || c == '\r') {
+          if (mcp_line_len > 0) {
+            mcp_line_buf[mcp_line_len] = '\0';
+            mcp_line_len = 0;
+            mcp_server_process_line(mcp_line_buf);
+            mcp_server_flush();
+          }
+        } else if (mcp_line_len < sizeof(mcp_line_buf) - 1) {
+          mcp_line_buf[mcp_line_len++] = (char)c;
+        }
+      }
+      if (execute && gameInfo.reader) {
+        NDS_exec<false>();
+        SPU_Emulate_user();
+      }
+    }
+
+    delete driver;
+    driver = NULL;
+#ifdef GDB_STUB
+    destroyStub_gdb(stubs[0]);
+    destroyStub_gdb(stubs[1]);
+    gdbstub_mutex_destroy();
+#endif
+    NDS_DeInit();
+    return 0;
+  }
+#endif
 
   error = NDS_LoadROM( my_config.nds_file.c_str() );
   if (error < 0) {
