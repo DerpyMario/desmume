@@ -1982,9 +1982,8 @@ int _main()
 		g_http_response_ready = CreateEvent(NULL, FALSE, FALSE, NULL);
 		mcp_http_start(MCP_HTTP_PORT, mcp_http_process_cb);
 		fprintf(stderr, "----------------------------------------------------------\n");
-		fprintf(stderr, "  DeSmuME MCP Server (HTTP + SSE)\n");
-		fprintf(stderr, "  POST http://127.0.0.1:%d/mcp  (JSON-RPC)\n", MCP_HTTP_PORT);
-		fprintf(stderr, "  GET  http://127.0.0.1:%d/mcp  (SSE stream)\n", MCP_HTTP_PORT);
+		fprintf(stderr, "  DeSmuME MCP Server (HTTP JSON-RPC)\n");
+		fprintf(stderr, "  POST http://127.0.0.1:%d/mcp\n", MCP_HTTP_PORT);
 		if (!cmdline.nds_file.empty())
 			fprintf(stderr, "  ROM: %s\n", cmdline.nds_file.c_str());
 		fprintf(stderr, "----------------------------------------------------------\n");
@@ -1993,13 +1992,13 @@ int _main()
 			if (execute && gameInfo.reader) {
 				NDS_exec<false>();
 				SPU_Emulate_user();
-			} else {
-				DWORD w = WaitForSingleObject(g_http_request_ready, 100);
-				if (w == WAIT_OBJECT_0) {
-					g_http_response_buf[0] = '\0';
-					mcp_server_process_line_http(g_http_request_body.c_str(), g_http_response_buf, sizeof(g_http_response_buf));
-					SetEvent(g_http_response_ready);
-				}
+			}
+			/* Process HTTP requests in both running and paused state (timeout 0 when running = poll once per frame). */
+			DWORD w = WaitForSingleObject(g_http_request_ready, (execute && gameInfo.reader) ? 0 : 100);
+			if (w == WAIT_OBJECT_0) {
+				g_http_response_buf[0] = '\0';
+				mcp_server_process_line_http(g_http_request_body.c_str(), g_http_response_buf, sizeof(g_http_response_buf));
+				SetEvent(g_http_response_ready);
 			}
 		}
 		mcp_http_stop();
@@ -4985,7 +4984,7 @@ DOKEYDOWN:
 					CloseHandle(pi.hThread);
 					CloseHandle(pi.hProcess);
 					MessageBoxA(MainWindow->getHWnd(),
-						"MCP server started in a new console window.\n\nConnect your MCP client to:\n  http://127.0.0.1:8765/mcp\n(POST = JSON-RPC, GET = SSE stream)",
+						"MCP server started in a new console window.\n\nConnect your MCP client to:\n  http://127.0.0.1:8765/mcp\n(HTTP POST, JSON-RPC)",
 						"MCP Server", MB_OK | MB_ICONINFORMATION);
 				} else {
 					MessageBoxA(MainWindow->getHWnd(), "Failed to start MCP server process.", "MCP Server", MB_OK | MB_ICONERROR);

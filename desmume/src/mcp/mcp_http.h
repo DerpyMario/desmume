@@ -19,14 +19,11 @@ extern "C" {
 /* Process callback: (request_body, response_buffer, response_size). Callback blocks until response is filled. */
 typedef void (*mcp_http_process_fn)(const char* body, char* resp_buf, size_t resp_size);
 
-/* Start HTTP server on 127.0.0.1:port. POST /mcp -> JSON-RPC; GET /mcp -> SSE. Runs in a background thread. */
+/* Start HTTP server on 127.0.0.1:port. POST /mcp (or /) = JSON-RPC only. Runs in a background thread. */
 void mcp_http_start(int port, mcp_http_process_fn process_cb);
 
 /* Stop server and join thread. */
 void mcp_http_stop(void);
-
-/* Send SSE event to all connected GET clients. Form: "data: " + event_data + "\n\n". */
-void mcp_http_sse_broadcast(const char* event_data);
 
 #ifdef __cplusplus
 }

@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <vector>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -25,9 +24,6 @@ static SOCKET g_listen_sock = INVALID_SOCKET;
 static HANDLE g_thread = NULL;
 static volatile long g_running = 0;
 static mcp_http_process_fn g_process_cb = NULL;
-
-static CRITICAL_SECTION g_sse_cs;
-static std::vector<SOCKET> g_sse_sockets;
 
 #define RESP_BUF_SIZE 65536
 
@@ -129,16 +125,8 @@ static DWORD WINAPI server_thread_proc(LPVOID param)
 			send_all(client, hdr, hlen);
 			send_all(client, resp_buf, (int)rlen);
 		} else if (strcmp(method, "GET") == 0 && is_mcp_path) {
-			const char* sse_hdr =
-				"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-			send_all(client, sse_hdr, (int)strlen(sse_hdr));
-			/* SSE comment (':') so Cursor/client does not parse as JSON-RPC; only data: lines are parsed. */
-			send_all(client, ": connected\n\n", 14);
-			EnterCriticalSection(&g_sse_cs);
-			g_sse_sockets.push_back(client);
-			LeaveCriticalSection(&g_sse_cs);
-			/* don't close client; keep for SSE */
-			client = INVALID_SOCKET;
+			const char* not_allowed = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+			send_all(client, not_allowed, (int)strlen(not_allowed));
 		} else {
 			const char* bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
 			send_all(client, bad, (int)strlen(bad));
@@ -154,7 +142,6 @@ void mcp_http_start(int port, mcp_http_process_fn process_cb)
 {
 	if (g_listen_sock != INVALID_SOCKET) return;
 	g_process_cb = process_cb;
-	InitializeCriticalSection(&g_sse_cs);
 
 	struct sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
@@ -191,35 +178,10 @@ void mcp_http_stop(void)
 		CloseHandle(g_thread);
 		g_thread = NULL;
 	}
-	EnterCriticalSection(&g_sse_cs);
-	for (size_t i = 0; i < g_sse_sockets.size(); i++)
-		closesocket(g_sse_sockets[i]);
-	g_sse_sockets.clear();
-	LeaveCriticalSection(&g_sse_cs);
-	DeleteCriticalSection(&g_sse_cs);
-}
-
-void mcp_http_sse_broadcast(const char* event_data)
-{
-	if (!event_data) return;
-	char line[4096];
-	int len = snprintf(line, sizeof(line), "data: %s\n\n", event_data);
-	if (len <= 0 || len >= (int)sizeof(line)) return;
-	EnterCriticalSection(&g_sse_cs);
-	for (size_t i = 0; i < g_sse_sockets.size(); i++) {
-		if (send(g_sse_sockets[i], line, len, 0) <= 0) {
-			closesocket(g_sse_sockets[i]);
-			g_sse_sockets[i] = g_sse_sockets.back();
-			g_sse_sockets.pop_back();
-			i--;
-		}
-	}
-	LeaveCriticalSection(&g_sse_cs);
 }
 
 #else
 /* Non-Windows: stub */
 void mcp_http_start(int port, mcp_http_process_fn process_cb) { (void)port; (void)process_cb; }
 void mcp_http_stop(void) {}
-void mcp_http_sse_broadcast(const char* event_data) { (void)event_data; }
 #endif
