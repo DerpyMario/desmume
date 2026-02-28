@@ -79,6 +79,12 @@
 #include "snddx.h"
 #include "sndxa2.h"
 #include "commandline.h"
+#ifdef HAVE_MCP
+#include "../../mcp/mcp_server.h"
+#include "../../mcp/mcp_http.h"
+#include <string>
+#include <vector>
+#endif
 #include "FEX_Interface.h"
 #include "OpenArchive.h"
 #include "utils/xstring.h"
@@ -1878,6 +1884,26 @@ static BOOL OpenCoreSystemCP(const char* filename_syscp)
 #define RENDERID_NULL_SAVED -1
 #define GPU3D_DEFAULT  GPU3D_SWRAST
 
+#ifdef HAVE_MCP
+static const int MCP_HTTP_PORT = 8765;
+static std::string g_http_request_body;
+static char g_http_response_buf[65536];
+static HANDLE g_http_request_ready = NULL;
+static HANDLE g_http_response_ready = NULL;
+static void mcp_http_process_cb(const char* body, char* resp_buf, size_t resp_size)
+{
+	if (!body || !resp_buf || resp_size == 0) return;
+	{ size_t n = 0; while (body[n] && n < 512u * 1024u) n++; g_http_request_body.assign(body, n); }
+	SetEvent(g_http_request_ready);
+	if (WaitForSingleObject(g_http_response_ready, 30000) == WAIT_OBJECT_0) {
+		size_t len = strlen(g_http_response_buf);
+		if (len >= resp_size) len = resp_size - 1;
+		memcpy(resp_buf, g_http_response_buf, len);
+		resp_buf[len] = '\0';
+	}
+}
+#endif
+
 DWORD wmTimerRes;
 int _main()
 {
@@ -1916,6 +1942,68 @@ int _main()
 
 	LoadWinPCap(isPCapSupported);
 
+	SYSTEM_INFO systemInfo;
+	GetSystemInfo(&systemInfo);
+	CommonSettings.num_cores = systemInfo.dwNumberOfProcessors;
+
+	CommandLine cmdline;
+	if(!cmdline.parse(__argc,__argv)) {
+		cmdline.errorHelp(__argv[0]);
+		return 1;
+	}
+	cmdline.validate();
+
+#ifdef HAVE_MCP
+	if (cmdline.enable_mcp) {
+		NDS_Init();
+		path.ReadPathSettings();
+		slot1_Init();
+		slot2_Init();
+		slot2_Change(NDS_SLOT2_AUTO);
+		backup_setManualBackupType(cmdline.autodetect_method >= 0 ? cmdline.autodetect_method : 0);
+		if (!cmdline.nds_file.empty()) {
+			if (NDS_LoadROM(cmdline.nds_file.c_str(), NULL, NULL) < 0) {
+				fprintf(stderr, "error while loading %s\n", cmdline.nds_file.c_str());
+				return 1;
+			}
+		}
+		execute = (cmdline.start_paused == 0);
+		mcp_server_init(
+			[](int run) { execute = (run != 0); },
+			[]() { return execute ? 1 : 0; }
+		);
+		g_http_request_ready = CreateEvent(NULL, FALSE, FALSE, NULL);
+		g_http_response_ready = CreateEvent(NULL, FALSE, FALSE, NULL);
+		mcp_http_start(MCP_HTTP_PORT, mcp_http_process_cb);
+		fprintf(stderr, "----------------------------------------------------------\n");
+		fprintf(stderr, "  DeSmuME MCP Server (HTTP + SSE)\n");
+		fprintf(stderr, "  POST http://127.0.0.1:%d/mcp  (JSON-RPC)\n", MCP_HTTP_PORT);
+		fprintf(stderr, "  GET  http://127.0.0.1:%d/mcp  (SSE stream)\n", MCP_HTTP_PORT);
+		if (!cmdline.nds_file.empty())
+			fprintf(stderr, "  ROM: %s\n", cmdline.nds_file.c_str());
+		fprintf(stderr, "----------------------------------------------------------\n");
+		fflush(stderr);
+		for (;;) {
+			if (execute && gameInfo.reader) {
+				NDS_exec<false>();
+				SPU_Emulate_user();
+			} else {
+				DWORD w = WaitForSingleObject(g_http_request_ready, 100);
+				if (w == WAIT_OBJECT_0) {
+					g_http_response_buf[0] = '\0';
+					mcp_server_process_line_http(g_http_request_body.c_str(), g_http_response_buf, sizeof(g_http_response_buf));
+					SetEvent(g_http_response_ready);
+				}
+			}
+		}
+		mcp_http_stop();
+		CloseHandle(g_http_request_ready);
+		CloseHandle(g_http_response_ready);
+		NDS_DeInit();
+		return 0;
+	}
+#endif
+
 	driver = new WinDriver();
 	WinGPUEvent = new Win32GPUEventHandler;
 
@@ -1927,13 +2015,6 @@ int _main()
 	display_done_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 
 //	struct configured_features my_config;
-
-	//try and detect this for users who don't specify it on the commandline
-	//(can't say I really blame them)
-	//this helps give a substantial speedup for singlecore users
-	SYSTEM_INFO systemInfo;
-	GetSystemInfo(&systemInfo);
-	CommonSettings.num_cores = systemInfo.dwNumberOfProcessors;
 
 	msgbox = &msgBoxWnd;
 
@@ -2055,13 +2136,6 @@ int _main()
 	CommonSettings.use_jit = false;
 #endif
 
-	//i think we should override the ini file with anything from the commandline
-	CommandLine cmdline;
-	if(!cmdline.parse(__argc,__argv)) {
-		cmdline.errorHelp(__argv[0]);
-		return 1;
-	}
-	cmdline.validate();
 	start_paused = cmdline.start_paused!=0;
 	
 	FrameLimit = (cmdline.disable_limiter == 1) ? false : GetPrivateProfileBool("FrameLimit", "FrameLimit", true, IniName);
@@ -4875,6 +4949,44 @@ DOKEYDOWN:
 		case ID_TOOLS_VIEWFSNITRO:
 			ViewFSNitro->open();
 			return 0;
+
+#ifdef HAVE_MCP
+		case IDM_TOOLS_START_MCP:
+			{
+				wchar_t exePath[MAX_PATH];
+				if (GetModuleFileNameW(NULL, exePath, MAX_PATH) == 0) {
+					MessageBoxA(MainWindow->getHWnd(), "Could not get executable path.", "MCP Server", MB_OK | MB_ICONWARNING);
+					return 0;
+				}
+				std::wstring cmdLine = L"\"";
+				cmdLine += exePath;
+				cmdLine += L"\" --mcp";
+				const char* romPath = NDS_GetLastRomPath();
+				if (romPath && romPath[0]) {
+					cmdLine += L" \"";
+					int rlen = MultiByteToWideChar(CP_UTF8, 0, romPath, -1, NULL, 0);
+					if (rlen > 0) {
+						std::vector<wchar_t> buf(rlen);
+						MultiByteToWideChar(CP_UTF8, 0, romPath, -1, buf.data(), rlen);
+						cmdLine += buf.data();
+					}
+					cmdLine += L"\"";
+				}
+				cmdLine += L'\0';
+				STARTUPINFOW si = { sizeof(si) };
+				PROCESS_INFORMATION pi = { 0 };
+				if (CreateProcessW(NULL, &cmdLine[0], NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+					CloseHandle(pi.hThread);
+					CloseHandle(pi.hProcess);
+					MessageBoxA(MainWindow->getHWnd(),
+						"MCP server started in a new console window.\n\nConnect your MCP client to:\n  http://127.0.0.1:8765/mcp\n(POST = JSON-RPC, GET = SSE stream)",
+						"MCP Server", MB_OK | MB_ICONINFORMATION);
+				} else {
+					MessageBoxA(MainWindow->getHWnd(), "Failed to start MCP server process.", "MCP Server", MB_OK | MB_ICONERROR);
+				}
+			}
+			return 0;
+#endif
 			//========================================================== Tools end
 
 		case IDM_MGPU:

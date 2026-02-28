@@ -28,6 +28,10 @@
 static mcp_set_execute_fn g_set_execute;
 static mcp_get_execute_fn g_get_execute;
 
+/* When set, send_response/send_error write to this buffer instead of stdout (for HTTP). */
+static char* g_http_response_buf = NULL;
+static size_t g_http_response_size = 0;
+
 void mcp_server_init(mcp_set_execute_fn set_execute, mcp_get_execute_fn get_execute)
 {
 	g_set_execute = set_execute;
@@ -115,8 +119,27 @@ static int get_arg_str(const char* json, const char* key, char* out, size_t out_
 	return 0;
 }
 
+static void escape_json_string(const char* in, char* out, size_t out_size)
+{
+	size_t j = 0;
+	for (; in && *in && j + 2 < out_size; in++) {
+		if (*in == '"' || *in == '\\') { out[j++] = '\\'; out[j++] = *in; }
+		else if ((unsigned char)*in < 32) { j += (size_t)snprintf(out + j, out_size - j, "\\u%04x", (unsigned char)*in); }
+		else out[j++] = *in;
+	}
+	out[j] = '\0';
+}
+
 static void send_response(const char* id_str, int id_num, int use_id_num, const char* result_json)
 {
+	if (g_http_response_buf && g_http_response_size > 0) {
+		int n = use_id_num
+			? snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", id_num, result_json)
+			: snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"result\":%s}", id_str, result_json);
+		if (n < 0 || (size_t)n >= g_http_response_size) n = (int)(g_http_response_size - 1);
+		g_http_response_buf[n] = '\0';
+		return;
+	}
 	if (use_id_num)
 		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}\n", id_num, result_json);
 	else
@@ -125,6 +148,16 @@ static void send_response(const char* id_str, int id_num, int use_id_num, const 
 
 static void send_error(const char* id_str, int id_num, int use_id_num, int code, const char* message)
 {
+	if (g_http_response_buf && g_http_response_size > 0) {
+		char escaped[512];
+		escape_json_string(message, escaped, sizeof(escaped));
+		int n = use_id_num
+			? snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":%d,\"message\":\"%s\"}}", id_num, code, escaped)
+			: snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"error\":{\"code\":%d,\"message\":\"%s\"}}", id_str, code, escaped);
+		if (n < 0 || (size_t)n >= g_http_response_size) n = (int)(g_http_response_size - 1);
+		g_http_response_buf[n] = '\0';
+		return;
+	}
 	if (use_id_num)
 		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":%d,\"message\":\"%s\"}}\n", id_num, code, message);
 	else
@@ -421,6 +454,17 @@ static void handle_tools_call(const char* json, char* id_str, int id_num, int us
 
 	/* MCP tools/call result: { "content": [ { "type": "text", "text": "..." } ] } */
 	send_response(id_str, id_num, use_id_num, result_buf);
+}
+
+void mcp_server_process_line_http(const char* line_buf, char* out_buf, size_t out_size)
+{
+	if (!out_buf || out_size == 0) return;
+	g_http_response_buf = out_buf;
+	g_http_response_size = out_size;
+	out_buf[0] = '\0';
+	mcp_server_process_line(line_buf);
+	g_http_response_buf = NULL;
+	g_http_response_size = 0;
 }
 
 void mcp_server_process_line(const char* line_buf)

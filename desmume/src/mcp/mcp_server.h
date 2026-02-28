@@ -32,6 +32,9 @@ void mcp_server_init(mcp_set_execute_fn set_execute, mcp_get_execute_fn get_exec
 /* Process one JSON-RPC request line (newline already stripped). Response is written to stdout. */
 void mcp_server_process_line(const char* line);
 
+/* Process one JSON-RPC request and write the single response line to out_buf (null-terminated). For HTTP transport. */
+void mcp_server_process_line_http(const char* line, char* out_buf, size_t out_size);
+
 /* Flush stdout after writing responses. */
 void mcp_server_flush(void);
 
