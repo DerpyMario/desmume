@@ -45,16 +45,21 @@ static int parse_http_request(const char* headers, size_t len, char* method, siz
 	i = 0;
 	while (p < end && *p != ' ' && *p != '\r' && *p != '\n' && i + 1 < path_size) { path[i++] = *p++; }
 	path[i] = '\0';
-	/* Find Content-Length: */
-	const char* cl = (const char*)memchr(headers, 'C', len);
-	while (cl && cl + 16 <= end) {
-		if (strncmp(cl, "Content-Length:", 15) == 0) {
+	/* Find Content-Length: (case-insensitive per HTTP) */
+	for (const char* cl = headers; cl + 14 <= end; cl++) {
+		if ((cl[0] == 'C' || cl[0] == 'c') &&
+		    (cl[1] == 'O' || cl[1] == 'o') && (cl[2] == 'N' || cl[2] == 'n') &&
+		    (cl[3] == 'T' || cl[3] == 't') && (cl[4] == 'E' || cl[4] == 'e') &&
+		    (cl[5] == 'N' || cl[5] == 'n') && (cl[6] == 'T' || cl[6] == 't') &&
+		    cl[7] == '-' && (cl[8] == 'L' || cl[8] == 'l') &&
+		    (cl[9] == 'E' || cl[9] == 'e') && (cl[10] == 'N' || cl[10] == 'n') &&
+		    (cl[11] == 'G' || cl[11] == 'g') && (cl[12] == 'T' || cl[12] == 't') &&
+		    (cl[13] == 'H' || cl[13] == 'h') && cl[14] == ':') {
 			cl += 15;
 			while (cl < end && (*cl == ' ' || *cl == '\t')) cl++;
 			*content_length = (int)strtol(cl, NULL, 10);
 			break;
 		}
-		cl = (const char*)memchr(cl + 1, 'C', (size_t)(end - (cl + 1)));
 	}
 	return 0;
 }
@@ -110,7 +115,8 @@ static DWORD WINAPI server_thread_proc(LPVOID param)
 			}
 		}
 
-		int is_mcp_path = (strcmp(path, "/mcp") == 0 || strcmp(path, "/") == 0);
+		/* Accept /mcp, /mcp/, /mcp?..., / (path is already truncated at first space) */
+		int is_mcp_path = (path[0] == '/' && (path[1] == '\0' || (path[1] == 'm' && path[2] == 'c' && path[3] == 'p' && (path[4] == '\0' || path[4] == '/' || path[4] == '?'))));
 
 		if (strcmp(method, "POST") == 0 && is_mcp_path && g_process_cb && body) {
 			resp_buf[0] = '\0';
@@ -126,7 +132,8 @@ static DWORD WINAPI server_thread_proc(LPVOID param)
 			const char* sse_hdr =
 				"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
 			send_all(client, sse_hdr, (int)strlen(sse_hdr));
-			send_all(client, "data: {\"event\":\"connected\"}\n\n", 32);
+			/* SSE comment (':') so Cursor/client does not parse as JSON-RPC; only data: lines are parsed. */
+			send_all(client, ": connected\n\n", 14);
 			EnterCriticalSection(&g_sse_cs);
 			g_sse_sockets.push_back(client);
 			LeaveCriticalSection(&g_sse_cs);
