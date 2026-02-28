@@ -1955,6 +1955,12 @@ int _main()
 
 #ifdef HAVE_MCP
 	if (cmdline.enable_mcp) {
+		/* GUI subsystem exe started with CREATE_NEW_CONSOLE: CRT stderr/stdout are not attached to the new console. Reopen so fprintf works. */
+		{
+			FILE* fp = NULL;
+			if (freopen_s(&fp, "CONOUT$", "w", stderr) == 0 && fp) (void)0;
+			if (freopen_s(&fp, "CONOUT$", "w", stdout) == 0 && fp) (void)0;
+		}
 		NDS_Init();
 		path.ReadPathSettings();
 		slot1_Init();
