@@ -19,10 +19,12 @@
 #include "../NDSSystem.h"
 #include "../MMU.h"
 #include "../armcpu.h"
+#include "../GPU.h"
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static mcp_set_execute_fn g_set_execute;
@@ -119,6 +121,54 @@ static int get_arg_str(const char* json, const char* key, char* out, size_t out_
 	return 0;
 }
 
+static int get_arg_bool(const char* json, const char* key, int* out, int default_val)
+{
+	const char* args = strstr(json, "\"arguments\"");
+	if (!args) { *out = default_val; return -1; }
+	args = strchr(args, '{');
+	if (!args) { *out = default_val; return -1; }
+	char search[80];
+	snprintf(search, sizeof(search), "\"%s\"", key);
+	const char* p = strstr(args, search);
+	if (!p) { *out = default_val; return -1; }
+	p += strlen(search);
+	while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
+	if (strncmp(p, "true", 4) == 0) { *out = 1; return 0; }
+	if (strncmp(p, "false", 5) == 0) { *out = 0; return 0; }
+	*out = (int)strtol(p, NULL, 0);
+	return 0;
+}
+
+static int str_ieq(const char* a, const char* b)
+{
+	if (!a || !b) return 0;
+	for (; *a && *b; a++, b++) {
+		char ca = (char)((*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a);
+		char cb = (char)((*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b);
+		if (ca != cb) return 0;
+	}
+	return *a == *b;
+}
+
+static const char kBase64Table[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64_encode(const u8* data, size_t len)
+{
+	std::string out;
+	out.reserve(((len + 2) / 3) * 4);
+	for (size_t i = 0; i < len; i += 3) {
+		unsigned int n = (unsigned int)data[i] << 16;
+		if (i + 1 < len) n |= (unsigned int)data[i + 1] << 8;
+		if (i + 2 < len) n |= (unsigned int)data[i + 2];
+		out.push_back(kBase64Table[(n >> 18) & 63]);
+		out.push_back(kBase64Table[(n >> 12) & 63]);
+		out.push_back((i + 1 < len) ? kBase64Table[(n >> 6) & 63] : '=');
+		out.push_back((i + 2 < len) ? kBase64Table[n & 63] : '=');
+	}
+	return out;
+}
+
 static void escape_json_string(const char* in, char* out, size_t out_size)
 {
 	size_t j = 0;
@@ -189,6 +239,10 @@ static void handle_tools_list(const char* json, char* id_str, int id_num, int us
 		",{\"name\":\"nds_clear_breakpoint\",\"description\":\"Clear one breakpoint. Same params as set (type, proc for execute, address in hex).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\"},\"proc\":{\"type\":\"integer\"},\"address\":{\"type\":\"string\"}},\"required\":[\"type\",\"address\"]}}"
 		",{\"name\":\"nds_clear_all_breakpoints\",\"description\":\"Clear all breakpoints (execute, read, write).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
 		",{\"name\":\"nds_list_breakpoints\",\"description\":\"List all breakpoints (execute ARM9/ARM7, read, write).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
+		",{\"name\":\"nds_screenshot\",\"description\":\"Capture the current display. screen: both|main|touch (default both). Optional path saves BMP to file instead of returning inline image.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"screen\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}}}}"
+		",{\"name\":\"nds_input_key\",\"description\":\"Press or release a DS button. button: A|B|X|Y|start|select|up|down|left|right|L|R|debug|lid. pressed: true (default) or false.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"button\":{\"type\":\"string\"},\"pressed\":{\"type\":\"boolean\"}},\"required\":[\"button\"]}}"
+		",{\"name\":\"nds_input_touch\",\"description\":\"Touch the bottom screen at pixel (x,y). Coordinates: x 0-255, y 0-191 (native touch screen). touch: true (default) press, false release.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"touch\":{\"type\":\"boolean\"}},\"required\":[\"x\",\"y\"]}}"
+		",{\"name\":\"nds_input_release_all\",\"description\":\"Release all DS buttons and touch.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
 		"]}";
 	send_response(id_str, id_num, use_id_num, tools);
 }
@@ -414,12 +468,247 @@ static void tool_nds_list_breakpoints(char* result, size_t result_size)
 	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", buf);
 }
 
+static void convert_native15_to_rgb24(const u16* src, u8* dst, int pixel_count)
+{
+	for (int i = 0; i < pixel_count; i++) {
+		u16 p = src[i];
+		dst[i * 3 + 0] = (u8)(((p >> 0) & 0x1f) << 3);
+		dst[i * 3 + 1] = (u8)(((p >> 5) & 0x1f) << 3);
+		dst[i * 3 + 2] = (u8)(((p >> 10) & 0x1f) << 3);
+	}
+}
+
+static std::vector<u8> build_bmp24(const u8* rgb, int width, int height)
+{
+	const int row_stride = ((width * 3 + 3) / 4) * 4;
+	const int data_size = row_stride * height;
+	const int file_size = 54 + data_size;
+	std::vector<u8> bmp((size_t)file_size, 0);
+
+	bmp[0] = 'B';
+	bmp[1] = 'M';
+	*(u32*)&bmp[2] = (u32)file_size;
+	*(u32*)&bmp[10] = 54;
+	*(u32*)&bmp[14] = 40;
+	*(u32*)&bmp[18] = (u32)width;
+	*(u32*)&bmp[22] = (u32)height;
+	*(u16*)&bmp[26] = 1;
+	*(u16*)&bmp[28] = 24;
+	*(u32*)&bmp[34] = (u32)data_size;
+
+	u8* dst = &bmp[54];
+	for (int y = height - 1; y >= 0; y--) {
+		const u8* src_row = rgb + (size_t)y * (size_t)width * 3;
+		memcpy(dst, src_row, (size_t)width * 3);
+		dst += width * 3;
+		for (int pad = row_stride - width * 3; pad > 0; pad--)
+			*dst++ = 0;
+	}
+	return bmp;
+}
+
+static bool save_bmp_file(const char* path, const u8* rgb, int width, int height)
+{
+	std::vector<u8> bmp = build_bmp24(rgb, width, height);
+	FILE* fp = fopen(path, "wb");
+	if (!fp) return false;
+	size_t wrote = fwrite(&bmp[0], 1, bmp.size(), fp);
+	fclose(fp);
+	return wrote == bmp.size();
+}
+
+static void tool_nds_screenshot(const char* json, std::string& result)
+{
+	if (!GPU) {
+		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: GPU not ready\"}]}";
+		return;
+	}
+
+	char screen[16] = "both";
+	char path[512] = {0};
+	get_arg_str(json, "screen", screen, sizeof(screen));
+	get_arg_str(json, "path", path, sizeof(path));
+
+	const NDSDisplayInfo& disp = GPU->GetDisplayInfo();
+	const u16* fb = disp.masterNativeBuffer16;
+	if (!fb) {
+		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: no framebuffer\"}]}";
+		return;
+	}
+
+	const int full_w = GPU_FRAMEBUFFER_NATIVE_WIDTH;
+	const int screen_h = GPU_FRAMEBUFFER_NATIVE_HEIGHT;
+	const int full_h = screen_h * 2;
+	const int pixels_per_screen = full_w * screen_h;
+
+	const u16* src = fb;
+	int width = full_w;
+	int height = full_h;
+
+	if (str_ieq(screen, "main")) {
+		height = screen_h;
+	} else if (str_ieq(screen, "touch")) {
+		src = fb + pixels_per_screen;
+		height = screen_h;
+	} else if (!str_ieq(screen, "both")) {
+		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: screen must be both, main, or touch\"}]}";
+		return;
+	}
+
+	const int pixel_count = width * height;
+	std::vector<u8> rgb((size_t)pixel_count * 3);
+	convert_native15_to_rgb24(src, &rgb[0], pixel_count);
+
+	if (path[0]) {
+		if (!save_bmp_file(path, &rgb[0], width, height)) {
+			result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: failed to write BMP\"}]}";
+			return;
+		}
+		char msg[640];
+		snprintf(msg, sizeof(msg), "OK: saved %dx%d BMP to %s", width, height, path);
+		char escaped[640];
+		escape_json_string(msg, escaped, sizeof(escaped));
+		result = std::string("{\"content\":[{\"type\":\"text\",\"text\":\"") + escaped + "\"}]}";
+		return;
+	}
+
+	std::vector<u8> bmp = build_bmp24(&rgb[0], width, height);
+	std::string b64 = base64_encode(&bmp[0], bmp.size());
+	char dim[64];
+	snprintf(dim, sizeof(dim), "%dx%d", width, height);
+	char dim_esc[64];
+	escape_json_string(dim, dim_esc, sizeof(dim_esc));
+
+	result.reserve(64 + b64.size());
+	result = "{\"content\":[{\"type\":\"image\",\"data\":\"";
+	result += b64;
+	result += "\",\"mimeType\":\"image/bmp\"},{\"type\":\"text\",\"text\":\"";
+	result += dim_esc;
+	result += "\"}]}";
+}
+
+static bool set_button_by_name(UserButtons& buttons, const char* name, bool pressed)
+{
+	if (str_ieq(name, "A")) buttons.A = pressed;
+	else if (str_ieq(name, "B")) buttons.B = pressed;
+	else if (str_ieq(name, "X")) buttons.X = pressed;
+	else if (str_ieq(name, "Y")) buttons.Y = pressed;
+	else if (str_ieq(name, "start")) buttons.S = pressed;
+	else if (str_ieq(name, "select")) buttons.T = pressed;
+	else if (str_ieq(name, "up")) buttons.U = pressed;
+	else if (str_ieq(name, "down")) buttons.D = pressed;
+	else if (str_ieq(name, "left")) buttons.L = pressed;
+	else if (str_ieq(name, "right")) buttons.R = pressed;
+	else if (str_ieq(name, "L")) buttons.W = pressed;
+	else if (str_ieq(name, "R")) buttons.E = pressed;
+	else if (str_ieq(name, "debug")) buttons.G = pressed;
+	else if (str_ieq(name, "lid")) buttons.F = pressed;
+	else return false;
+	return true;
+}
+
+static void apply_user_buttons(const UserButtons& buttons)
+{
+	NDS_setPad(
+		buttons.R, buttons.L, buttons.D, buttons.U,
+		buttons.T, buttons.S, buttons.B, buttons.A,
+		buttons.Y, buttons.X, buttons.W, buttons.E,
+		buttons.G, buttons.F);
+	NDS_beginProcessingInput();
+	NDS_getProcessingUserInput().buttons = buttons;
+	NDS_endProcessingInput();
+}
+
+static u16 clamp_touch_coord(int value, int maximum)
+{
+	if (value < 0) value = 0;
+	if (value >= maximum) value = maximum - 1;
+	return (u16)value;
+}
+
+static void apply_user_touch(u16 x, u16 y, bool touch)
+{
+	if (touch) {
+		NDS_setTouchPos(x, y);
+	} else {
+		NDS_releaseTouch();
+	}
+	NDS_beginProcessingInput();
+	UserTouch& t = NDS_getProcessingUserInput().touch;
+	if (touch) {
+		t.touchX = (u16)((x << 4) & 0x0FF0);
+		t.touchY = (u16)((y << 4) & 0x0FF0);
+		t.isTouch = true;
+	} else {
+		t.touchX = 0;
+		t.touchY = 0;
+		t.isTouch = false;
+	}
+	NDS_endProcessingInput();
+}
+
+static void tool_nds_input_touch(const char* json, char* result, size_t result_size)
+{
+	int x = 0, y = 0;
+	int touch_on = 1;
+	if (get_arg_int(json, "x", &x) != 0 || get_arg_int(json, "y", &y) != 0) {
+		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing x or y\"}]}");
+		return;
+	}
+	get_arg_bool(json, "touch", &touch_on, 1);
+
+	if (touch_on) {
+		u16 px = clamp_touch_coord(x, GPU_FRAMEBUFFER_NATIVE_WIDTH);
+		u16 py = clamp_touch_coord(y, GPU_FRAMEBUFFER_NATIVE_HEIGHT);
+		apply_user_touch(px, py, true);
+		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: touch at (%u,%u)\"}]}", (unsigned)px, (unsigned)py);
+	} else {
+		apply_user_touch(0, 0, false);
+		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: touch released\"}]}");
+	}
+}
+
+static void tool_nds_input_key(const char* json, char* result, size_t result_size)
+{
+	char button[32] = {0};
+	if (get_arg_str(json, "button", button, sizeof(button)) != 0) {
+		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing button\"}]}");
+		return;
+	}
+
+	int pressed = 1;
+	get_arg_bool(json, "pressed", &pressed, 1);
+
+	UserButtons buttons = NDS_getRawUserInput().buttons;
+	if (!set_button_by_name(buttons, button, pressed != 0)) {
+		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: unknown button (A,B,X,Y,start,select,up,down,left,right,L,R,debug,lid)\"}]}");
+		return;
+	}
+
+	apply_user_buttons(buttons);
+	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: %s %s\"}]}", button, pressed ? "pressed" : "released");
+}
+
+static void tool_nds_input_release_all(char* result, size_t result_size)
+{
+	UserButtons buttons = {};
+	apply_user_buttons(buttons);
+	NDS_releaseTouch();
+	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: all keys released\"}]}");
+}
+
 static void handle_tools_call(const char* json, char* id_str, int id_num, int use_id_num)
 {
 	char name[64] = {0};
 	find_json_string_val(json, "name", name, sizeof(name));
+	std::string result_large;
 	char result_buf[1024];
-	if (strcmp(name, "nds_pause") == 0)
+	const char* result_ptr = result_buf;
+
+	if (strcmp(name, "nds_screenshot") == 0) {
+		tool_nds_screenshot(json, result_large);
+		result_ptr = result_large.c_str();
+	} else if (strcmp(name, "nds_pause") == 0)
 		tool_nds_pause(result_buf, sizeof(result_buf));
 	else if (strcmp(name, "nds_resume") == 0)
 		tool_nds_resume(result_buf, sizeof(result_buf));
@@ -449,11 +738,17 @@ static void handle_tools_call(const char* json, char* id_str, int id_num, int us
 		tool_nds_clear_all_breakpoints(result_buf, sizeof(result_buf));
 	else if (strcmp(name, "nds_list_breakpoints") == 0)
 		tool_nds_list_breakpoints(result_buf, sizeof(result_buf));
+	else if (strcmp(name, "nds_input_key") == 0)
+		tool_nds_input_key(json, result_buf, sizeof(result_buf));
+	else if (strcmp(name, "nds_input_touch") == 0)
+		tool_nds_input_touch(json, result_buf, sizeof(result_buf));
+	else if (strcmp(name, "nds_input_release_all") == 0)
+		tool_nds_input_release_all(result_buf, sizeof(result_buf));
 	else
 		snprintf(result_buf, sizeof(result_buf), "{\"content\":[{\"type\":\"text\",\"text\":\"unknown tool: %s\"}]}", name);
 
 	/* MCP tools/call result: { "content": [ { "type": "text", "text": "..." } ] } */
-	send_response(id_str, id_num, use_id_num, result_buf);
+	send_response(id_str, id_num, use_id_num, result_ptr);
 }
 
 void mcp_server_process_line_http(const char* line_buf, char* out_buf, size_t out_size)

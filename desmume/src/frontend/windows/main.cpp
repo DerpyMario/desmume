@@ -1887,7 +1887,7 @@ static BOOL OpenCoreSystemCP(const char* filename_syscp)
 #ifdef HAVE_MCP
 static const int MCP_HTTP_PORT = 8765;
 static std::string g_http_request_body;
-static char g_http_response_buf[65536];
+static char g_http_response_buf[524288];
 static HANDLE g_http_request_ready = NULL;
 static HANDLE g_http_response_ready = NULL;
 static void mcp_http_process_cb(const char* body, char* resp_buf, size_t resp_size)
