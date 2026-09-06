@@ -80,9 +80,14 @@ stream, `DELETE` with `204`, and CORS preflights are answered.
 
 Addresses are hex by default, so `"02000000"` and `"0x02000000"` mean the same thing.
 
-Read and write breakpoints pause emulation on every build. Execute breakpoints are
-recorded on every platform but only the Windows frontend checks them in the CPU loop,
-and `nds_set_breakpoint` says so in its answer when that is the case.
+Breakpoints pause emulation wherever DeSmuME runs. `nds_get_state` reports what
+stopped it (`stopped on execute breakpoint at 0x0200000C on ARM9`), and so do
+`nds_run_frames` and `nds_step` when they end early. Resuming runs past the
+breakpoint that stopped you instead of stopping on it again, so a breakpoint inside a
+loop yields one iteration per resume.
+
+Reads and writes the debugger itself performs (`nds_read_memory`, `nds_write_memory`,
+`nds_search_memory`) never trip read or write breakpoints, only the emulated CPUs do.
 
 A typical scripted interaction presses a button for a few frames and then looks at the
 result:

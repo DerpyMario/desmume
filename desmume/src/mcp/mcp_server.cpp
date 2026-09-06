@@ -350,6 +350,17 @@ static bool IsROMLoaded()
 	otherwise the frame counter would advance without a single instruction executing.
 	A memory breakpoint clears the global execute flag, which ends the run early.
 */
+/*
+	A breakpoint on the address a CPU is sitting at must not fire before that
+	instruction has had a chance to run, otherwise resuming from a breakpoint (or
+	setting one on the current PC) would stop again without making progress.
+*/
+static void ArmBreakpointSkip()
+{
+	NDS_ARM9.breakpointSkipAddress = NDS_ARM9.instruct_adr;
+	NDS_ARM7.breakpointSkipAddress = NDS_ARM7.instruct_adr;
+}
+
 static void SetExecute(bool run)
 {
 	if (g_setExecute != NULL)
@@ -366,6 +377,7 @@ static int RunFrames(int frames)
 
 	if (wasStalled)
 		NDS_debug_continue();
+	ArmBreakpointSkip();
 	SetExecute(true);
 
 	int ran = 0;
@@ -389,6 +401,23 @@ static int RunFrames(int frames)
 	return ran;
 }
 
+/* "execute breakpoint at 0x02000008 on ARM9", or empty when nothing is pending. */
+static std::string BreakpointHitDescription()
+{
+	const char *kind = NULL;
+	switch (nds_breakpointHit.type)
+	{
+		case NDS_BREAKPOINT_EXECUTE: kind = "execute"; break;
+		case NDS_BREAKPOINT_READ:    kind = "read";    break;
+		case NDS_BREAKPOINT_WRITE:   kind = "write";   break;
+		default:                     return std::string();
+	}
+
+	return Format("%s breakpoint at 0x%08X on ARM%d", kind,
+		(unsigned)nds_breakpointHit.address,
+		(nds_breakpointHit.procnum != 0) ? 7 : 9);
+}
+
 static std::string ToolGetState()
 {
 	const bool running = (g_getExecute != NULL) ? (g_getExecute() != 0) : false;
@@ -406,6 +435,10 @@ static std::string ToolGetState()
 	if (IsROMLoaded())
 		text += Format("\nROM: title=%s serial=%s size=%u", gameInfo.ROMname, gameInfo.ROMserial, (unsigned)gameInfo.romsize);
 
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += "\nstopped on " + breakpoint;
+
 	return TextResult(text);
 }
 
@@ -419,6 +452,8 @@ static std::string ToolPause()
 
 static std::string ToolResume()
 {
+	NDS_ClearBreakpointHit();
+	ArmBreakpointSkip();
 	if (g_setExecute != NULL)
 		g_setExecute(1);
 	NDS_debug_continue();
@@ -436,6 +471,8 @@ static std::string ToolStep(const mcpjson::Value &args)
 
 	armcpu_t &cpu = CPUFromArgs(args);
 	const int proc = ProcessorFromArgs(args);
+
+	NDS_ClearBreakpointHit();
 
 	//a paused emulator has its CPUs stalled, which would keep them from executing
 	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
@@ -476,7 +513,11 @@ static std::string ToolStep(const mcpjson::Value &args)
 
 	std::string text = Format("stepped %ld instruction(s) on ARM%d; ARM9 PC=0x%08X ARM7 PC=0x%08X",
 		stepped, (proc != 0) ? 7 : 9, (unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM7.instruct_adr);
-	if (stepped < count)
+
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += Format(" (stopped on %s)", breakpoint.c_str());
+	else if (stepped < count)
 		text += " (stopped early: the CPU is halted)";
 
 	return TextResult(text);
@@ -491,11 +532,17 @@ static std::string ToolRunFrames(const mcpjson::Value &args)
 	if (frames < 1) frames = 1;
 	if (frames > MAX_RUN_FRAMES) frames = MAX_RUN_FRAMES;
 
+	NDS_ClearBreakpointHit();
+
 	const int ran = RunFrames((int)frames);
 
 	std::string text = Format("ran %d frame(s); frame=%d ARM9 PC=0x%08X", ran, currFrameCounter, (unsigned)NDS_ARM9.instruct_adr);
-	if (ran < frames)
-		text += " (stopped early: a breakpoint paused emulation)";
+
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += Format(" (stopped early on %s)", breakpoint.c_str());
+	else if (ran < frames)
+		text += " (stopped early)";
 
 	return TextResult(text);
 }
@@ -914,14 +961,7 @@ static std::string ToolSetBreakpoint(const mcpjson::Value &args)
 	list->push_back(address);
 
 	if (type == "execute")
-	{
-		std::string text = Format("execute breakpoint at 0x%08X on ARM%d", (unsigned)address, (proc != 0) ? 7 : 9);
-#if !defined(HOST_WINDOWS) || defined(TARGET_INTERFACE)
-		//only the Windows frontend checks these in the CPU loop
-		text += " (recorded, but this build only enforces read and write breakpoints)";
-#endif
-		return TextResult(text);
-	}
+		return TextResult(Format("execute breakpoint at 0x%08X on ARM%d", (unsigned)address, (proc != 0) ? 7 : 9));
 	return TextResult(Format("%s breakpoint at 0x%08X", type.c_str(), (unsigned)address));
 }
 
@@ -1292,7 +1332,7 @@ static const char *TOOLS_JSON = R"json({"tools":[
 {"name":"nds_get_registers","description":"Read the ARM register file of one CPU.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."}}}},
 {"name":"nds_set_register","description":"Write one ARM register.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"register":{"type":"string","description":"R0-R15, PC, SP, LR or CPSR."},"value":{"type":"string","description":"New value, hex by default."}},"required":["register","value"]}},
 {"name":"nds_disassemble","description":"Disassemble instructions starting at an address.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"address":{"type":"string","description":"Start address, hex. Defaults to the current PC."},"count":{"type":"integer","description":"Instructions to disassemble, default 8, max 128."},"thumb":{"type":"boolean","description":"Force THUMB decoding. Defaults to the current CPU state."}}}},
-{"name":"nds_set_breakpoint","description":"Set an execute, read or write breakpoint. Read and write breakpoints pause emulation on every build; execute breakpoints are only enforced by the Windows frontend.","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"execute (default), read or write."},"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7, for execute breakpoints."},"address":{"type":"string","description":"Address, hex."}},"required":["address"]}},
+{"name":"nds_set_breakpoint","description":"Set an execute, read or write breakpoint. Emulation pauses when one is hit, and nds_get_state reports which one; resuming runs past it.","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"execute (default), read or write."},"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7, for execute breakpoints."},"address":{"type":"string","description":"Address, hex."}},"required":["address"]}},
 {"name":"nds_clear_breakpoint","description":"Clear one breakpoint.","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"execute (default), read or write."},"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7, for execute breakpoints."},"address":{"type":"string","description":"Address, hex."}},"required":["address"]}},
 {"name":"nds_clear_all_breakpoints","description":"Clear every execute, read and write breakpoint.","inputSchema":{"type":"object","properties":{}}},
 {"name":"nds_list_breakpoints","description":"List every breakpoint currently set.","inputSchema":{"type":"object","properties":{}}},

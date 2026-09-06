@@ -50,6 +50,9 @@
 
 #define INSTRUCTION_INDEX(i) ((((i)>>16)&0xFF0)|(((i)>>4)&0xF))
 
+//armcpu_t::breakpointSkipAddress when there is no breakpoint to step off of
+#define ARMCPU_NO_BREAKPOINT_SKIP 0xFFFFFFFF
+
 inline u32 ROR(u32 i, u32 j)   { return ((((u32)(i))>>(j)) | (((u32)(i))<<(32-(j)))); }
 
 template<typename T>
@@ -315,6 +318,9 @@ struct armcpu_t
 	u32 stepOverBreak;
 	std::vector<u32> *breakPoints;
 	bool debugStep;
+	//address of the execute breakpoint we already stopped on, so that resuming
+	//runs the instruction under it instead of breaking on it again
+	u32 breakpointSkipAddress;
 };
 
 void armcpu_SetControlInterface(armcpu_t *armcpu, const armcpu_ctrl_iface *theCtrlInterface);
