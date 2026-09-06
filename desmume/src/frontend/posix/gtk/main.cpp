@@ -481,6 +481,19 @@ fill_configured_features( class configured_features *config,
   if(!config->validate())
     goto error;
 
+#ifdef HAVE_MCP
+  if (config->enable_mcp) {
+    /* the MCP server drives emulation itself, so it runs in the headless CLI */
+    g_printerr("The MCP server runs headless: use desmume-cli --mcp (or --mcp-port PORT).\n");
+    goto error;
+  }
+#endif
+
+  if (config->headless) {
+    g_printerr("This frontend always opens a window: use desmume-cli --headless.\n");
+    goto error;
+  }
+
   if (config->savetype < 0 || config->savetype > 6) {
     g_printerr("Accepted savetypes are from 0 to 6.\n");
     return false;

@@ -48,3 +48,8 @@ option('gdb-stub',
   value: false,
   description: 'Enable gdb stub',
 )
+option('mcp',
+  type: 'boolean',
+  value: true,
+  description: 'Enable the MCP server (--mcp, --mcp-port)',
+)

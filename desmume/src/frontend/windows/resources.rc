@@ -1878,6 +1878,8 @@ BEGIN
             MENUITEM "New Lua Script Window...",    IDC_NEW_LUA_SCRIPT
             MENUITEM "Close All Script Windows",    IDC_CLOSE_LUA_SCRIPTS
         END
+        MENUITEM SEPARATOR
+        MENUITEM "Start MCP &Server...",            IDM_TOOLS_START_MCP
     END
     POPUP "&Help"
     BEGIN

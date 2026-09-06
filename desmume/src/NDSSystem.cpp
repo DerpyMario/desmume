@@ -709,6 +709,11 @@ struct LastRom {
 	std::string filename, physicalName, logicalFilename;
 } lastRom;
 
+const char* NDS_GetLastRomPath(void)
+{
+	return lastRom.filename.empty() ? NULL : lastRom.filename.c_str();
+}
+
 int NDS_LoadROM(const char *filename, const char *physicalName, const char *logicalFilename)
 {
 	lastRom.filename = filename;
@@ -1985,6 +1990,29 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			}
 		}
 		#endif //HOST_WINDOWS
+		#if !(defined(HOST_WINDOWS) && !defined(TARGET_INTERFACE))
+		/* Execution breakpoints for non-Windows (e.g. MCP/CLI). Can set before ROM load. */
+		if (NDS_ARM9.breakPoints) {
+			const std::vector<u32> *breakpointList9 = NDS_ARM9.breakPoints;
+			for (size_t i = 0; i < breakpointList9->size(); ++i) {
+				if (NDS_ARM9.instruct_adr == (*breakpointList9)[i] && !NDS_ARM9.debugStep) {
+					NDS_debug_break();
+					execute = false;
+					return std::make_pair(arm9, arm7);
+				}
+			}
+		}
+		if (NDS_ARM7.breakPoints) {
+			const std::vector<u32> *breakpointList7 = NDS_ARM7.breakPoints;
+			for (size_t i = 0; i < breakpointList7->size(); ++i) {
+				if (NDS_ARM7.instruct_adr == (*breakpointList7)[i] && !NDS_ARM7.debugStep) {
+					NDS_debug_break();
+					execute = false;
+					return std::make_pair(arm9, arm7);
+				}
+			}
+		}
+		#endif
 
 		if(doarm9 && (!doarm7 || arm9 <= timer))
 		{

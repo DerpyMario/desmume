@@ -245,3 +245,6 @@ libdesmume_a_SOURCES += ../../gdbstub/gdbstub.cpp
 libdesmume_a_SOURCES += ../../gdbstub/gdbstub_internal.h
 libdesmume_a_SOURCES += ../../gdbstub.h
 endif
+libdesmume_a_SOURCES += ../../mcp/mcp_server.cpp ../../mcp/mcp_server.h
+libdesmume_a_SOURCES += ../../mcp/mcp_http.cpp ../../mcp/mcp_http.h
+libdesmume_a_SOURCES += ../../mcp/mcp_json.cpp ../../mcp/mcp_json.h

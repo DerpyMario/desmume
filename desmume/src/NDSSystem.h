@@ -450,6 +450,8 @@ void NDS_suspendProcessingInput(bool suspend);
 
 int NDS_LoadROM(const char *filename, const char* physicalFilename=0, const char* logicalFilename=0);
 void NDS_FreeROM(void);
+/** Return path of last loaded ROM (for reload). NULL if none loaded. */
+const char* NDS_GetLastRomPath(void);
 void NDS_Reset();
 
 bool NDS_LegitBoot();

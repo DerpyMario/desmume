@@ -1013,6 +1013,7 @@
 #define ID_CLOSE                        40111
 #define ID_STREAMFROMDISK               40111
 #define ID_FSNITRO_VIEW                 40112
+#define IDM_TOOLS_START_MCP             40113
 #define IDM_FAQ                         40116
 #define IDM_WIKI                        40117
 #define ID_MAGNIFICATIONFILTER_2XBRZ    40118

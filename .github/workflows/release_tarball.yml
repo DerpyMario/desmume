@@ -1,20 +1,26 @@
 name: Generate Source Tarball
 
-# Trigger whenever a release is created
+# Run on demand only
 on:
-  release:
-    types:
-      - created
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package (e.g. release_0_9_14)'
+        required: true
+        type: string
 
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
 
     - uses: actions/checkout@v3
       with:
         submodules: recursive
+        ref: ${{ inputs.tag }}
 
     - name: archive
       id: archive
@@ -23,21 +29,16 @@ jobs:
         cd desmume/src/frontend/posix
         autoreconf -i
         cd "$THISDIR"
-        VERSION=$(printf "%s\n" ${{ github.event.release.tag_name }} | sed -e 's/^release_//' -e 's/_/./g')
+        VERSION=$(printf "%s\n" '${{ inputs.tag }}' | sed -e 's/^release_//' -e 's/_/./g')
         PKGNAME="desmume-$VERSION"
         mkdir -p /tmp/$PKGNAME
         mv * /tmp/$PKGNAME
         mv /tmp/$PKGNAME .
         TARBALL=$PKGNAME.tar.xz
         tar cJf $TARBALL $PKGNAME
-        echo "::set-output name=tarball::$TARBALL"
+        echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
     - name: upload tarball
-      uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ github.event.release.upload_url }}
-        asset_path: ./${{ steps.archive.outputs.tarball }}
-        asset_name: ${{ steps.archive.outputs.tarball }}
-        asset_content_type: application/x-xz
+      run: gh release upload '${{ inputs.tag }}' './${{ steps.archive.outputs.tarball }}' --clobber
