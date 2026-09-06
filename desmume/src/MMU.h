@@ -676,6 +676,29 @@ extern u32 _MMU_MAIN_MEM_MASK16;
 extern u32 _MMU_MAIN_MEM_MASK32;
 void SetupMMU(bool debugConsole, bool dsi);
 
+/*
+	Stops emulation when a CPU reads from or writes to a watched address.
+
+	Accesses a debugger makes on the user's behalf are tagged MMU_AT_DEBUG and are
+	deliberately ignored, otherwise reading memory would trip the very breakpoints
+	the user is trying to observe.
+*/
+FORCEINLINE void CheckMemoryBreakpoint(const std::vector<u32> &breakPoints, const NDSBreakpointType type, const MMU_ACCESS_TYPE AT, const u32 procnum, const u32 addr)
+{
+	if (breakPoints.empty() || AT == MMU_AT_DEBUG)
+		return;
+
+	for (size_t i = 0; i < breakPoints.size(); i++)
+	{
+		if (breakPoints[i] != addr)
+			continue;
+
+		NDS_ReportBreakpointHit(type, procnum, addr);
+		execute = false;
+		return;
+	}
+}
+
 FORCEINLINE void CheckMemoryDebugEvent(EDEBUG_EVENT event, const MMU_ACCESS_TYPE type, const u32 procnum, const u32 addr, const u32 size, const u32 val)
 {
 	//TODO - ugh work out a better prefetch event system
@@ -721,15 +744,7 @@ FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u3
     call_registered_interface_mem_hook(addr, 1, HOOK_READ);
 #endif
 
-	// break points, wheee
-	for (size_t i = 0; i < memReadBreakPoints.size(); ++i)
-	{
-		if (addr == memReadBreakPoints[i])
-		{
-			execute = false;
-			i = memReadBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memReadBreakPoints, NDS_BREAKPOINT_READ, AT, PROCNUM, addr);
 
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)
@@ -769,15 +784,7 @@ FORCEINLINE u16 _MMU_read16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u
     call_registered_interface_mem_hook(addr, 2, HOOK_READ);
 #endif
 
-	// break points, wheee
-	for (size_t i = 0; i < memReadBreakPoints.size(); ++i)
-	{
-		if (addr == memReadBreakPoints[i])
-		{
-			execute = false;
-			i = memReadBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memReadBreakPoints, NDS_BREAKPOINT_READ, AT, PROCNUM, addr);
 
 	//special handling for execution from arm9, since we spend so much time in there
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_CODE)
@@ -829,15 +836,7 @@ FORCEINLINE u32 _MMU_read32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u
 #ifdef TARGET_INTERFACE
     call_registered_interface_mem_hook(addr, 4, HOOK_READ);
 #endif
-	// break points, wheee
-	for (size_t i = 0; i < memReadBreakPoints.size(); ++i)
-	{
-		if (addr == memReadBreakPoints[i])
-		{
-			execute = false;
-			i = memReadBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memReadBreakPoints, NDS_BREAKPOINT_READ, AT, PROCNUM, addr);
 
 	//special handling for execution from arm9, since we spend so much time in there
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_CODE)
@@ -894,15 +893,7 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion) return; //dtcm
 	}
 
-	// break points, wheee
-	for (size_t i = 0; i < memWriteBreakPoints.size(); ++i)
-	{
-		if (addr == memWriteBreakPoints[i])
-		{
-			execute = false;
-			i = memWriteBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memWriteBreakPoints, NDS_BREAKPOINT_WRITE, AT, PROCNUM, addr);
 
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)
@@ -952,15 +943,7 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion) return; //dtcm
 	}
 
-	// break points, wheee
-	for (size_t i = 0; i < memWriteBreakPoints.size(); ++i)
-	{
-		if (addr == memWriteBreakPoints[i])
-		{
-			execute = false;
-			i = memWriteBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memWriteBreakPoints, NDS_BREAKPOINT_WRITE, AT, PROCNUM, addr);
 
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)
@@ -1007,15 +990,7 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion) return; //dtcm
 	}
 
-	// break points, wheee
-	for (size_t i = 0; i < memWriteBreakPoints.size(); ++i)
-	{
-		if (addr == memWriteBreakPoints[i])
-		{
-			execute = false;
-			i = memWriteBreakPoints.size();
-		}
-	}
+	CheckMemoryBreakpoint(memWriteBreakPoints, NDS_BREAKPOINT_WRITE, AT, PROCNUM, addr);
 
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)

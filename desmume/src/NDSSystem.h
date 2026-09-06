@@ -389,6 +389,28 @@ extern GameInfo gameInfo;
 extern std::vector<u32> memReadBreakPoints;
 extern std::vector<u32> memWriteBreakPoints;
 
+//What stopped emulation last, so that a debugger can say why it is sitting where it is.
+//Execute breakpoints are checked in the CPU loop, read and write breakpoints in the MMU.
+enum NDSBreakpointType
+{
+	NDS_BREAKPOINT_NONE = 0,
+	NDS_BREAKPOINT_EXECUTE,
+	NDS_BREAKPOINT_READ,
+	NDS_BREAKPOINT_WRITE
+};
+
+struct NDSBreakpointHit
+{
+	NDSBreakpointType type;
+	u32 procnum;
+	u32 address;
+};
+
+extern NDSBreakpointHit nds_breakpointHit;
+
+void NDS_ReportBreakpointHit(NDSBreakpointType type, u32 procnum, u32 address);
+void NDS_ClearBreakpointHit();
+
 
 struct UserButtons : buttonstruct<bool>
 {

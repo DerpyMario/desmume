@@ -104,6 +104,22 @@ CFIRMWARE *extFirmwareObj = NULL;
 std::vector<u32> memReadBreakPoints;
 std::vector<u32> memWriteBreakPoints;
 
+NDSBreakpointHit nds_breakpointHit = { NDS_BREAKPOINT_NONE, 0, 0 };
+
+void NDS_ReportBreakpointHit(NDSBreakpointType type, u32 procnum, u32 address)
+{
+	nds_breakpointHit.type = type;
+	nds_breakpointHit.procnum = procnum;
+	nds_breakpointHit.address = address;
+}
+
+void NDS_ClearBreakpointHit()
+{
+	nds_breakpointHit.type = NDS_BREAKPOINT_NONE;
+	nds_breakpointHit.procnum = 0;
+	nds_breakpointHit.address = 0;
+}
+
 bool singleStep;
 bool nds_debug_continuing[2];
 int lagframecounter;
@@ -1952,6 +1968,40 @@ static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
 		return arm7;
 }
 
+/*
+	Stops emulation when a CPU is about to execute an address with a breakpoint on it.
+
+	Resuming has to get past the breakpoint it stopped on, so the address that was
+	reported is remembered and skipped until the CPU has moved somewhere else. That
+	is also why a single step, which sets debugStep, is never interrupted here.
+*/
+static FORCEINLINE bool CheckExecuteBreakpoint(armcpu_t &cpu, const u32 procnum)
+{
+	if (cpu.breakPoints == NULL || cpu.breakPoints->empty() || cpu.debugStep)
+		return false;
+
+	const u32 pc = cpu.instruct_adr;
+
+	if (cpu.breakpointSkipAddress == pc)
+		return false;  //resuming from this one
+
+	cpu.breakpointSkipAddress = ARMCPU_NO_BREAKPOINT_SKIP;
+
+	const std::vector<u32> &breakPoints = *cpu.breakPoints;
+	for (size_t i = 0; i < breakPoints.size(); i++)
+	{
+		if (breakPoints[i] != pc)
+			continue;
+
+		cpu.breakpointSkipAddress = pc;
+		NDS_ReportBreakpointHit(NDS_BREAKPOINT_EXECUTE, procnum, pc);
+		execute = false;
+		return true;
+	}
+
+	return false;
+}
+
 #ifdef HAVE_JIT
 template<bool doarm9, bool doarm7, bool jit>
 #else
@@ -1964,55 +2014,28 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 	while(timer < s32next && !sequencer.reschedule && execute)
 	{
 		// breakpoint handling
-		#if defined(HOST_WINDOWS) && !defined(TARGET_INTERFACE)
-		const std::vector<u32> *breakpointList9 = NDS_ARM9.breakPoints;
-		for (int i = 0; i < breakpointList9->size(); ++i) {
-			if (NDS_ARM9.instruct_adr == (*breakpointList9)[i] && !NDS_ARM9.debugStep) {
-				emu_paused = true;
-				paused = true;
-				execute = false;
-				// update debug display
-				PostMessageA(DisViewWnd[0], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM9.instruct_adr);
-				InvalidateRect(DisViewWnd[0], NULL, FALSE);
-				return std::make_pair(arm9, arm7);
-			}
+		if (doarm9 && CheckExecuteBreakpoint(NDS_ARM9, ARMCPU_ARM9))
+		{
+			#if defined(HOST_WINDOWS) && !defined(TARGET_INTERFACE)
+			emu_paused = true;
+			paused = true;
+			// update debug display
+			PostMessageA(DisViewWnd[0], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM9.instruct_adr);
+			InvalidateRect(DisViewWnd[0], NULL, FALSE);
+			#endif
+			return std::make_pair(arm9, arm7);
 		}
-		const std::vector<u32> *breakpointList7 = NDS_ARM7.breakPoints;
-		for (int i = 0; i < breakpointList7->size(); ++i) {
-			if (NDS_ARM7.instruct_adr == (*breakpointList7)[i] && !NDS_ARM7.debugStep) {
-				emu_paused = true;
-				paused = true;
-				execute = false;
-				// update debug display
-				PostMessageA(DisViewWnd[1], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM7.instruct_adr);
-				InvalidateRect(DisViewWnd[1], NULL, FALSE);
-				return std::make_pair(arm9, arm7);
-			}
+		if (doarm7 && CheckExecuteBreakpoint(NDS_ARM7, ARMCPU_ARM7))
+		{
+			#if defined(HOST_WINDOWS) && !defined(TARGET_INTERFACE)
+			emu_paused = true;
+			paused = true;
+			// update debug display
+			PostMessageA(DisViewWnd[1], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM7.instruct_adr);
+			InvalidateRect(DisViewWnd[1], NULL, FALSE);
+			#endif
+			return std::make_pair(arm9, arm7);
 		}
-		#endif //HOST_WINDOWS
-		#if !(defined(HOST_WINDOWS) && !defined(TARGET_INTERFACE))
-		/* Execution breakpoints for non-Windows (e.g. MCP/CLI). Can set before ROM load. */
-		if (NDS_ARM9.breakPoints) {
-			const std::vector<u32> *breakpointList9 = NDS_ARM9.breakPoints;
-			for (size_t i = 0; i < breakpointList9->size(); ++i) {
-				if (NDS_ARM9.instruct_adr == (*breakpointList9)[i] && !NDS_ARM9.debugStep) {
-					NDS_debug_break();
-					execute = false;
-					return std::make_pair(arm9, arm7);
-				}
-			}
-		}
-		if (NDS_ARM7.breakPoints) {
-			const std::vector<u32> *breakpointList7 = NDS_ARM7.breakPoints;
-			for (size_t i = 0; i < breakpointList7->size(); ++i) {
-				if (NDS_ARM7.instruct_adr == (*breakpointList7)[i] && !NDS_ARM7.debugStep) {
-					NDS_debug_break();
-					execute = false;
-					return std::make_pair(arm9, arm7);
-				}
-			}
-		}
-		#endif
 
 		if(doarm9 && (!doarm7 || arm9 <= timer))
 		{
@@ -2731,6 +2754,9 @@ void NDS_Reset()
 	}
 
 	PrepareLogfiles();
+
+	//nothing is stopped on a breakpoint any more
+	NDS_ClearBreakpointHit();
 
 	CommonSettings.gamehacks.apply();
 

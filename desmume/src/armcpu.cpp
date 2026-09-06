@@ -241,6 +241,7 @@ void armcpu_init(armcpu_t *armcpu, u32 adr)
 	armcpu->intVector = 0xFFFF0000 * (armcpu->proc_ID==0);
 	armcpu->freeze = CPU_FREEZE_NONE;
 	armcpu->intrWaitARM_state = 0;
+	armcpu->breakpointSkipAddress = ARMCPU_NO_BREAKPOINT_SKIP;
 
 //#ifdef GDB_STUB
 //    armcpu->irq_flag = 0;
