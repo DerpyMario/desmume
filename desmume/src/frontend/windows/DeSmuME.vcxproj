@@ -81,6 +81,7 @@
     <ClCompile Include="..\..\commandline.cpp" />
     <ClCompile Include="..\..\mcp\mcp_server.cpp" />
     <ClCompile Include="..\..\mcp\mcp_http.cpp" />
+    <ClCompile Include="..\..\mcp\mcp_json.cpp" />
     <ClCompile Include="..\..\common.cpp" />
     <ClCompile Include="..\..\cp15.cpp" />
     <ClCompile Include="..\..\Database.cpp" />
@@ -407,6 +408,9 @@
     </ClInclude>
     <ClInclude Include="..\..\version.h" />
     <ClInclude Include="..\..\armcpu.h" />
+    <ClInclude Include="..\..\mcp\mcp_server.h" />
+    <ClInclude Include="..\..\mcp\mcp_http.h" />
+    <ClInclude Include="..\..\mcp\mcp_json.h" />
     <ClInclude Include="..\..\arm_jit.h" />
     <ClInclude Include="..\..\bios.h" />
     <ClInclude Include="..\..\cheatSystem.h" />

@@ -81,7 +81,6 @@
 #include "commandline.h"
 #ifdef HAVE_MCP
 #include "../../mcp/mcp_server.h"
-#include "../../mcp/mcp_http.h"
 #include <string>
 #include <vector>
 #endif
@@ -1885,23 +1884,7 @@ static BOOL OpenCoreSystemCP(const char* filename_syscp)
 #define GPU3D_DEFAULT  GPU3D_SWRAST
 
 #ifdef HAVE_MCP
-static const int MCP_HTTP_PORT = 8765;
-static std::string g_http_request_body;
-static char g_http_response_buf[524288];
-static HANDLE g_http_request_ready = NULL;
-static HANDLE g_http_response_ready = NULL;
-static void mcp_http_process_cb(const char* body, char* resp_buf, size_t resp_size)
-{
-	if (!body || !resp_buf || resp_size == 0) return;
-	{ size_t n = 0; while (body[n] && n < 512u * 1024u) n++; g_http_request_body.assign(body, n); }
-	SetEvent(g_http_request_ready);
-	if (WaitForSingleObject(g_http_response_ready, 30000) == WAIT_OBJECT_0) {
-		size_t len = strlen(g_http_response_buf);
-		if (len >= resp_size) len = resp_size - 1;
-		memcpy(resp_buf, g_http_response_buf, len);
-		resp_buf[len] = '\0';
-	}
-}
+static const int MCP_HTTP_PORT_DEFAULT = 8765;
 #endif
 
 DWORD wmTimerRes;
@@ -1978,32 +1961,55 @@ int _main()
 			[](int run) { execute = (run != 0); },
 			[]() { return execute ? 1 : 0; }
 		);
-		g_http_request_ready = CreateEvent(NULL, FALSE, FALSE, NULL);
-		g_http_response_ready = CreateEvent(NULL, FALSE, FALSE, NULL);
-		mcp_http_start(MCP_HTTP_PORT, mcp_http_process_cb);
+
+		/* this port is a GUI subsystem exe, so stdio is not a usable transport here */
+		const int mcpPort = (cmdline.mcp_port > 0) ? cmdline.mcp_port : MCP_HTTP_PORT_DEFAULT;
+		if (mcp_server_start_http(mcpPort) != 0) {
+			fprintf(stderr, "Failed to start the MCP server on 127.0.0.1:%d\n", mcpPort);
+			fflush(stderr);
+			NDS_DeInit();
+			return 1;
+		}
+
 		fprintf(stderr, "----------------------------------------------------------\n");
 		fprintf(stderr, "  DeSmuME MCP Server (HTTP JSON-RPC)\n");
-		fprintf(stderr, "  POST http://127.0.0.1:%d/mcp\n", MCP_HTTP_PORT);
+		fprintf(stderr, "  POST http://127.0.0.1:%d/mcp\n", mcpPort);
 		if (!cmdline.nds_file.empty())
 			fprintf(stderr, "  ROM: %s\n", cmdline.nds_file.c_str());
 		fprintf(stderr, "----------------------------------------------------------\n");
 		fflush(stderr);
-		for (;;) {
-			if (execute && gameInfo.reader) {
+
+		DWORD limiterStart = timeGetTime();
+		u64 limiterFrames = 0;
+
+		while (!mcp_server_quit_requested()) {
+			const bool running = (execute && gameInfo.reader != NULL);
+
+			if (running) {
 				NDS_exec<false>();
 				SPU_Emulate_user();
 			}
-			/* Process HTTP requests in both running and paused state (timeout 0 when running = poll once per frame). */
-			DWORD w = WaitForSingleObject(g_http_request_ready, (execute && gameInfo.reader) ? 0 : 100);
-			if (w == WAIT_OBJECT_0) {
-				g_http_response_buf[0] = '\0';
-				mcp_server_process_line_http(g_http_request_body.c_str(), g_http_response_buf, sizeof(g_http_response_buf));
-				SetEvent(g_http_response_ready);
+
+			/* requests are served while running and while paused; only a paused emulator waits */
+			mcp_server_poll(running ? 0 : 50);
+
+			if (running && !cmdline.disable_limiter) {
+				//count frames from a fixed start so that rounding does not accumulate
+				limiterFrames++;
+				const DWORD now = timeGetTime();
+				const DWORD target = limiterStart + (DWORD)(limiterFrames * 1000ULL / 60ULL);
+				const LONG delay = (LONG)(target - now);
+				if (delay > 0 && delay <= 500) {
+					Sleep((DWORD)delay);
+				} else if (delay < -500 || delay > 500) {
+					/* we fell behind or the clock jumped: restart the cadence */
+					limiterStart = now;
+					limiterFrames = 0;
+				}
 			}
 		}
-		mcp_http_stop();
-		CloseHandle(g_http_request_ready);
-		CloseHandle(g_http_response_ready);
+
+		mcp_server_deinit();
 		NDS_DeInit();
 		return 0;
 	}

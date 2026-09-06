@@ -16,784 +16,1809 @@
 */
 
 #include "mcp_server.h"
+#include "mcp_http.h"
+#include "mcp_json.h"
+
 #include "../NDSSystem.h"
 #include "../MMU.h"
+#include "../SPU.h"
 #include "../armcpu.h"
 #include "../GPU.h"
+#include "../movie.h"
+#include "../saves.h"
+#include "../frontend/modules/Disassembler.h"
+
+#include <zlib.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <cctype>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-#include <vector>
 
-static mcp_set_execute_fn g_set_execute;
-static mcp_get_execute_fn g_get_execute;
+#ifdef _WIN32
+	#include <io.h>
+	#define MCP_DUP _dup
+	#define MCP_DUP2 _dup2
+	#define MCP_FILENO _fileno
+	#define MCP_FDOPEN _fdopen
+#else
+	#include <unistd.h>
+	#define MCP_DUP dup
+	#define MCP_DUP2 dup2
+	#define MCP_FILENO fileno
+	#define MCP_FDOPEN fdopen
+#endif
 
-/* When set, send_response/send_error write to this buffer instead of stdout (for HTTP). */
-static char* g_http_response_buf = NULL;
-static size_t g_http_response_size = 0;
+/* Protocol versions this server understands, newest first. */
+static const char *SUPPORTED_PROTOCOL_VERSIONS[] = { "2025-06-18", "2025-03-26", "2024-11-05" };
+static const char *DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 
-void mcp_server_init(mcp_set_execute_fn set_execute, mcp_get_execute_fn get_execute)
+static const char *SERVER_NAME = "desmume-mcp";
+static const char *SERVER_VERSION = "1.0.0";
+
+static const size_t MAX_MEMORY_READ = 4096;
+static const int MAX_RUN_FRAMES = 3600;
+
+static mcp_set_execute_fn g_setExecute = NULL;
+static mcp_get_execute_fn g_getExecute = NULL;
+static bool g_quitRequested = false;
+
+//---------------------------------------------------------------------------
+// JSON-RPC plumbing
+//---------------------------------------------------------------------------
+
+static std::string IDLiteral(const mcpjson::Value *id)
 {
-	g_set_execute = set_execute;
-	g_get_execute = get_execute;
+	if (id == NULL || id->IsNull())
+		return "null";
+	if (id->IsNumber())
+		return id->raw;
+	if (id->IsString())
+		return mcpjson::Quote(id->str);
+	if (id->IsBool())
+		return id->boolean ? "true" : "false";
+	return "null";
 }
 
-/* Minimal JSON-RPC parsing: find "method":"...", "id":... , "params":{...} */
-static const char* find_json_string_val(const char* json, const char* key, char* out, size_t out_size)
+static std::string MakeResult(const std::string &idLiteral, const std::string &resultJSON)
 {
-	char search[80];
-	snprintf(search, sizeof(search), "\"%s\"", key);
-	const char* p = strstr(json, search);
-	if (!p) return NULL;
-	p += strlen(search);
-	while (*p && (*p == ' ' || *p == '\t')) p++;
-	if (*p != ':') return NULL;
-	p++;
-	while (*p && (*p == ' ' || *p == '\t')) p++;
-	if (*p != '"') return NULL;
-	p++;
-	const char* start = p;
-	while (*p && *p != '"') {
-		if (*p == '\\') p++;
-		p++;
-	}
-	size_t len = (size_t)(p - start);
-	if (len >= out_size) len = out_size - 1;
-	memcpy(out, start, len);
-	out[len] = '\0';
-	return p;
+	std::string out("{\"jsonrpc\":\"2.0\",\"id\":");
+	out += idLiteral;
+	out += ",\"result\":";
+	out += resultJSON;
+	out += "}";
+	return out;
 }
 
-static int find_json_int_val(const char* json, const char* key, int* out)
+static std::string MakeError(const std::string &idLiteral, int code, const std::string &message)
 {
-	char search[64];
-	snprintf(search, sizeof(search), "\"%s\"", key);
-	const char* p = strstr(json, search);
-	if (!p) return -1;
-	p += strlen(search);
-	while (*p && (*p == ' ' || *p == '\t')) p++;
-	if (*p != ':') return -1;
-	p++;
-	while (*p && (*p == ' ' || *p == '\t')) p++;
-	*out = (int)strtol(p, NULL, 10);
-	return 0;
+	char codeText[32];
+	snprintf(codeText, sizeof(codeText), "%d", code);
+
+	std::string out("{\"jsonrpc\":\"2.0\",\"id\":");
+	out += idLiteral;
+	out += ",\"error\":{\"code\":";
+	out += codeText;
+	out += ",\"message\":";
+	out += mcpjson::Quote(message);
+	out += "}}";
+	return out;
 }
 
-/* Get "arguments" object and then key from it (for tools/call). */
-static int get_arg_int(const char* json, const char* key, int* out)
+/* A tools/call result carrying a single block of text. */
+static std::string TextResult(const std::string &text, bool isError = false)
 {
-	const char* args = strstr(json, "\"arguments\"");
-	if (!args) return -1;
-	args = strchr(args, '{');
-	if (!args) return -1;
-	char search[80];
-	snprintf(search, sizeof(search), "\"%s\"", key);
-	const char* p = strstr(args, search);
-	if (!p) return -1;
-	p += strlen(search);
-	while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
-	*out = (int)strtol(p, NULL, 0);
-	return 0;
+	std::string out("{\"content\":[{\"type\":\"text\",\"text\":");
+	out += mcpjson::Quote(text);
+	out += "}],\"isError\":";
+	out += isError ? "true" : "false";
+	out += "}";
+	return out;
 }
 
-static int get_arg_str(const char* json, const char* key, char* out, size_t out_size)
+static std::string ErrorResult(const std::string &text)
 {
-	const char* args = strstr(json, "\"arguments\"");
-	if (!args) return -1;
-	args = strchr(args, '{');
-	if (!args) return -1;
-	char search[80];
-	snprintf(search, sizeof(search), "\"%s\"", key);
-	const char* p = strstr(args, search);
-	if (!p) return -1;
-	p += strlen(search);
-	while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
-	if (*p != '"') return -1;
-	p++;
-	const char* start = p;
-	while (*p && *p != '"') { if (*p == '\\') p++; p++; }
-	size_t len = (size_t)(p - start);
-	if (len >= out_size) len = out_size - 1;
-	memcpy(out, start, len);
-	out[len] = '\0';
-	return 0;
+	return TextResult(text, true);
 }
 
-static int get_arg_bool(const char* json, const char* key, int* out, int default_val)
+static std::string Format(const char *format, ...)
 {
-	const char* args = strstr(json, "\"arguments\"");
-	if (!args) { *out = default_val; return -1; }
-	args = strchr(args, '{');
-	if (!args) { *out = default_val; return -1; }
-	char search[80];
-	snprintf(search, sizeof(search), "\"%s\"", key);
-	const char* p = strstr(args, search);
-	if (!p) { *out = default_val; return -1; }
-	p += strlen(search);
-	while (*p && (*p == ' ' || *p == '\t' || *p == ':')) p++;
-	if (strncmp(p, "true", 4) == 0) { *out = 1; return 0; }
-	if (strncmp(p, "false", 5) == 0) { *out = 0; return 0; }
-	*out = (int)strtol(p, NULL, 0);
-	return 0;
+	char buffer[1024];
+	va_list args;
+	va_start(args, format);
+	const int length = vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	if (length < 0)
+		return std::string();
+	if ((size_t)length < sizeof(buffer))
+		return std::string(buffer, (size_t)length);
+
+	std::vector<char> large((size_t)length + 1);
+	va_start(args, format);
+	vsnprintf(&large[0], large.size(), format, args);
+	va_end(args);
+	return std::string(&large[0], (size_t)length);
 }
 
-static int str_ieq(const char* a, const char* b)
-{
-	if (!a || !b) return 0;
-	for (; *a && *b; a++, b++) {
-		char ca = (char)((*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a);
-		char cb = (char)((*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b);
-		if (ca != cb) return 0;
-	}
-	return *a == *b;
-}
+//---------------------------------------------------------------------------
+// Image helpers
+//---------------------------------------------------------------------------
 
-static const char kBase64Table[] =
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char BASE64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static std::string base64_encode(const u8* data, size_t len)
+static std::string Base64Encode(const u8 *data, size_t length)
 {
 	std::string out;
-	out.reserve(((len + 2) / 3) * 4);
-	for (size_t i = 0; i < len; i += 3) {
+	out.reserve(((length + 2) / 3) * 4);
+	for (size_t i = 0; i < length; i += 3)
+	{
 		unsigned int n = (unsigned int)data[i] << 16;
-		if (i + 1 < len) n |= (unsigned int)data[i + 1] << 8;
-		if (i + 2 < len) n |= (unsigned int)data[i + 2];
-		out.push_back(kBase64Table[(n >> 18) & 63]);
-		out.push_back(kBase64Table[(n >> 12) & 63]);
-		out.push_back((i + 1 < len) ? kBase64Table[(n >> 6) & 63] : '=');
-		out.push_back((i + 2 < len) ? kBase64Table[n & 63] : '=');
+		if (i + 1 < length) n |= (unsigned int)data[i + 1] << 8;
+		if (i + 2 < length) n |= (unsigned int)data[i + 2];
+		out.push_back(BASE64_TABLE[(n >> 18) & 63]);
+		out.push_back(BASE64_TABLE[(n >> 12) & 63]);
+		out.push_back((i + 1 < length) ? BASE64_TABLE[(n >> 6) & 63] : '=');
+		out.push_back((i + 2 < length) ? BASE64_TABLE[n & 63] : '=');
 	}
 	return out;
 }
 
-static void escape_json_string(const char* in, char* out, size_t out_size)
+static void ConvertNative15ToRGB24(const u16 *src, u8 *dst, size_t pixelCount)
 {
-	size_t j = 0;
-	for (; in && *in && j + 2 < out_size; in++) {
-		if (*in == '"' || *in == '\\') { out[j++] = '\\'; out[j++] = *in; }
-		else if ((unsigned char)*in < 32) { j += (size_t)snprintf(out + j, out_size - j, "\\u%04x", (unsigned char)*in); }
-		else out[j++] = *in;
-	}
-	out[j] = '\0';
-}
-
-static void send_response(const char* id_str, int id_num, int use_id_num, const char* result_json)
-{
-	if (g_http_response_buf && g_http_response_size > 0) {
-		int n = use_id_num
-			? snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}", id_num, result_json)
-			: snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"result\":%s}", id_str, result_json);
-		if (n < 0 || (size_t)n >= g_http_response_size) n = (int)(g_http_response_size - 1);
-		g_http_response_buf[n] = '\0';
-		return;
-	}
-	if (use_id_num)
-		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":%s}\n", id_num, result_json);
-	else
-		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"result\":%s}\n", id_str, result_json);
-}
-
-static void send_error(const char* id_str, int id_num, int use_id_num, int code, const char* message)
-{
-	if (g_http_response_buf && g_http_response_size > 0) {
-		char escaped[512];
-		escape_json_string(message, escaped, sizeof(escaped));
-		int n = use_id_num
-			? snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":%d,\"message\":\"%s\"}}", id_num, code, escaped)
-			: snprintf(g_http_response_buf, g_http_response_size, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"error\":{\"code\":%d,\"message\":\"%s\"}}", id_str, code, escaped);
-		if (n < 0 || (size_t)n >= g_http_response_size) n = (int)(g_http_response_size - 1);
-		g_http_response_buf[n] = '\0';
-		return;
-	}
-	if (use_id_num)
-		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":%d,\"message\":\"%s\"}}\n", id_num, code, message);
-	else
-		fprintf(stdout, "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"error\":{\"code\":%d,\"message\":\"%s\"}}\n", id_str, code, message);
-}
-
-static void handle_initialize(const char* json, char* id_str, int id_num, int use_id_num)
-{
-	/* Result: { "protocolVersion": "2024-11-05", "capabilities": { "tools": {} }, "serverInfo": { "name": "desmume-mcp", "version": "0.1.0" } } */
-	send_response(id_str, id_num, use_id_num,
-		"{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"desmume-mcp\",\"version\":\"0.1.0\"}}");
-}
-
-static void handle_tools_list(const char* json, char* id_str, int id_num, int use_id_num)
-{
-	const char* tools = "{\"tools\":["
-		"{\"name\":\"nds_pause\",\"description\":\"Pause NDS emulation (break into debugger)\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_resume\",\"description\":\"Resume NDS emulation\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_step\",\"description\":\"Single step one instruction (both CPUs)\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_read_memory\",\"description\":\"Read memory from NDS address space. proc: 0=ARM9, 1=ARM7; address and size in hex.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"proc\":{\"type\":\"integer\"},\"address\":{\"type\":\"string\"},\"size\":{\"type\":\"integer\"}},\"required\":[\"proc\",\"address\",\"size\"]}}"
-		",{\"name\":\"nds_write_memory\",\"description\":\"Write bytes to NDS memory. proc: 0=ARM9, 1=ARM7; address in hex, value hex string (e.g. AABBCCDD for 4 bytes).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"proc\":{\"type\":\"integer\"},\"address\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"proc\",\"address\",\"value\"]}}"
-		",{\"name\":\"nds_get_registers\",\"description\":\"Get ARM registers for one CPU. proc: 0=ARM9, 1=ARM7.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"proc\":{\"type\":\"integer\"}},\"required\":[\"proc\"]}}"
-		",{\"name\":\"nds_get_state\",\"description\":\"Get current emulator state: running, PC ARM9/ARM7, ROM info.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_load_rom\",\"description\":\"Load a NDS ROM file. path: file path.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}"
-		",{\"name\":\"nds_reload_rom\",\"description\":\"Reload the currently loaded ROM (same path as last load). Fails if no ROM was loaded.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_reset\",\"description\":\"Reset the NDS console.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_get_rom_info\",\"description\":\"Get loaded ROM title and code.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_set_breakpoint\",\"description\":\"Set a breakpoint (can be set before loading ROM). type: execute|read|write; proc: 0=ARM9, 1=ARM7 (for execute); address: hex (e.g. 02000000).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\"},\"proc\":{\"type\":\"integer\"},\"address\":{\"type\":\"string\"}},\"required\":[\"type\",\"address\"]}}"
-		",{\"name\":\"nds_clear_breakpoint\",\"description\":\"Clear one breakpoint. Same params as set (type, proc for execute, address in hex).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\"},\"proc\":{\"type\":\"integer\"},\"address\":{\"type\":\"string\"}},\"required\":[\"type\",\"address\"]}}"
-		",{\"name\":\"nds_clear_all_breakpoints\",\"description\":\"Clear all breakpoints (execute, read, write).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_list_breakpoints\",\"description\":\"List all breakpoints (execute ARM9/ARM7, read, write).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		",{\"name\":\"nds_screenshot\",\"description\":\"Capture the current display. screen: both|main|touch (default both). Optional path saves BMP to file instead of returning inline image.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"screen\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}}}}"
-		",{\"name\":\"nds_input_key\",\"description\":\"Press or release a DS button. button: A|B|X|Y|start|select|up|down|left|right|L|R|debug|lid. pressed: true (default) or false.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"button\":{\"type\":\"string\"},\"pressed\":{\"type\":\"boolean\"}},\"required\":[\"button\"]}}"
-		",{\"name\":\"nds_input_touch\",\"description\":\"Touch the bottom screen at pixel (x,y). Coordinates: x 0-255, y 0-191 (native touch screen). touch: true (default) press, false release.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"touch\":{\"type\":\"boolean\"}},\"required\":[\"x\",\"y\"]}}"
-		",{\"name\":\"nds_input_release_all\",\"description\":\"Release all DS buttons and touch.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
-		"]}";
-	send_response(id_str, id_num, use_id_num, tools);
-}
-
-static void tool_nds_pause(char* result, size_t result_size)
-{
-	if (g_set_execute) g_set_execute(0);
-	NDS_debug_break();
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: paused\"}]}");
-}
-
-static void tool_nds_resume(char* result, size_t result_size)
-{
-	if (g_set_execute) g_set_execute(1);
-	NDS_debug_continue();
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: running\"}]}");
-}
-
-static void tool_nds_step(char* result, size_t result_size)
-{
-	if (g_set_execute) g_set_execute(1);
-	NDS_debug_step();
-	NDS_ARM9.debugStep = true;
-	NDS_ARM7.debugStep = true;
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: step\"}]}");
-}
-
-static void tool_nds_read_memory(const char* json, char* result, size_t result_size)
-{
-	int proc = 0;
-	int size = 4;
-	char addr_str[32] = {0};
-	if (get_arg_int(json, "proc", &proc) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing proc\"}]}"); return; }
-	if (get_arg_str(json, "address", addr_str, sizeof(addr_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing address\"}]}"); return; }
-	get_arg_int(json, "size", &size);
-	if (size <= 0 || size > 256) size = 4;
-	u32 addr = (u32)strtoul(addr_str, NULL, 16);
-	int p = (proc != 0) ? 1 : 0;
-	char hex[600];
-	char* h = hex;
-	*h = '\0';
-	for (int i = 0; i < size; i += 4) {
-		u32 v = MMU_read32(p, addr + i);
-		h += sprintf(h, "%08X ", (unsigned)v);
-	}
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", hex);
-}
-
-static void tool_nds_write_memory(const char* json, char* result, size_t result_size)
-{
-	int proc = 0;
-	char addr_str[32] = {0}, val_str[256] = {0};
-	if (get_arg_int(json, "proc", &proc) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing proc\"}]}"); return; }
-	if (get_arg_str(json, "address", addr_str, sizeof(addr_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing address\"}]}"); return; }
-	if (get_arg_str(json, "value", val_str, sizeof(val_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing value\"}]}"); return; }
-	u32 addr = (u32)strtoul(addr_str, NULL, 16);
-	int p = (proc != 0) ? 1 : 0;
-	size_t len = strlen(val_str);
-	if (len & 1) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: value must be even hex length\"}]}"); return; }
-	for (size_t i = 0; i < len; i += 2) {
-		char byte[3] = { val_str[i], val_str[i+1], '\0' };
-		u8 b = (u8)strtoul(byte, NULL, 16);
-		MMU_write8(p, addr + (u32)(i/2), b);
-	}
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: written %zu bytes\"}]}", len/2);
-}
-
-static void tool_nds_get_registers(const char* json, char* result, size_t result_size)
-{
-	int proc = 0;
-	get_arg_int(json, "proc", &proc);
-	armcpu_t* cpu = (proc != 0) ? &NDS_ARM7 : &NDS_ARM9;
-	char buf[512];
-	char* b = buf;
-	b += sprintf(b, "PC=0x%08X CPSR=0x%08X ", cpu->instruct_adr, (unsigned)cpu->CPSR.val);
-	for (int i = 0; i < 16; i++)
-		b += sprintf(b, "R%d=0x%08X ", i, (unsigned)cpu->R[i]);
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", buf);
-}
-
-static void tool_nds_get_state(char* result, size_t result_size)
-{
-	int running = g_get_execute ? g_get_execute() : 0;
-	char buf[400];
-	snprintf(buf, sizeof(buf),
-		"running=%d ARM9_PC=0x%08X ARM7_PC=0x%08X",
-		running,
-		(unsigned)NDS_ARM9.instruct_adr,
-		(unsigned)NDS_ARM7.instruct_adr);
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", buf);
-}
-
-static void tool_nds_load_rom(const char* json, char* result, size_t result_size)
-{
-	char path[512] = {0};
-	if (get_arg_str(json, "path", path, sizeof(path)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing path\"}]}"); return; }
-	int ret = NDS_LoadROM(path, NULL, NULL);
-	if (ret < 0)
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: load failed %d\"}]}", ret);
-	else
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: loaded\"}]}");
-}
-
-static void tool_nds_reload_rom(char* result, size_t result_size)
-{
-	const char* path = NDS_GetLastRomPath();
-	if (!path || !path[0]) {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: no ROM loaded to reload\"}]}");
-		return;
-	}
-	int ret = NDS_LoadROM(path, NULL, NULL);
-	if (ret < 0)
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: reload failed %d\"}]}", ret);
-	else
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: reloaded\"}]}");
-}
-
-static void tool_nds_reset(char* result, size_t result_size)
-{
-	NDS_Reset();
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: reset\"}]}");
-}
-
-static void tool_nds_get_rom_info(char* result, size_t result_size)
-{
-	NDS_header* h = NDS_getROMHeader();
-	if (!h) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"no ROM loaded\"}]}"); return; }
-	char title[13];
-	memcpy(title, h->gameTile, 12);
-	title[12] = '\0';
-	char code[5];
-	memcpy(code, h->gameCode, 4);
-	code[4] = '\0';
-	char buf[256];
-	snprintf(buf, sizeof(buf), "title=%s code=%s", title, code);
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", buf);
-}
-
-static void tool_nds_set_breakpoint(const char* json, char* result, size_t result_size)
-{
-	char type_str[32] = {0}, addr_str[32] = {0};
-	int proc = 0;
-	if (get_arg_str(json, "type", type_str, sizeof(type_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing type (execute|read|write)\"}]}"); return; }
-	if (get_arg_str(json, "address", addr_str, sizeof(addr_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing address\"}]}"); return; }
-	get_arg_int(json, "proc", &proc);
-	u32 addr = (u32)strtoul(addr_str, NULL, 16);
-
-	if (strcmp(type_str, "execute") == 0) {
-		std::vector<u32>* bp = (proc != 0) ? NDS_ARM7.breakPoints : NDS_ARM9.breakPoints;
-		if (!bp) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: CPU breakpoints not ready\"}]}"); return; }
-		for (size_t i = 0; i < bp->size(); i++) if ((*bp)[i] == addr) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: already set\"}]}"); return; }
-		bp->push_back(addr);
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: execute breakpoint at 0x%08X %s\"}]}", (unsigned)addr, proc ? "ARM7" : "ARM9");
-	} else if (strcmp(type_str, "read") == 0) {
-		for (size_t i = 0; i < memReadBreakPoints.size(); i++) if (memReadBreakPoints[i] == addr) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: already set\"}]}"); return; }
-		memReadBreakPoints.push_back(addr);
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: read breakpoint at 0x%08X\"}]}", (unsigned)addr);
-	} else if (strcmp(type_str, "write") == 0) {
-		for (size_t i = 0; i < memWriteBreakPoints.size(); i++) if (memWriteBreakPoints[i] == addr) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: already set\"}]}"); return; }
-		memWriteBreakPoints.push_back(addr);
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: write breakpoint at 0x%08X\"}]}", (unsigned)addr);
-	} else {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: type must be execute, read, or write\"}]}");
+	for (size_t i = 0; i < pixelCount; i++)
+	{
+		const u16 pixel = src[i];
+		dst[i * 3 + 0] = (u8)(((pixel >> 0) & 0x1F) << 3);
+		dst[i * 3 + 1] = (u8)(((pixel >> 5) & 0x1F) << 3);
+		dst[i * 3 + 2] = (u8)(((pixel >> 10) & 0x1F) << 3);
 	}
 }
 
-static void tool_nds_clear_breakpoint(const char* json, char* result, size_t result_size)
+static std::vector<u8> BuildBMP24(const u8 *rgb, int width, int height)
 {
-	char type_str[32] = {0}, addr_str[32] = {0};
-	int proc = 0;
-	if (get_arg_str(json, "type", type_str, sizeof(type_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing type\"}]}"); return; }
-	if (get_arg_str(json, "address", addr_str, sizeof(addr_str)) != 0) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing address\"}]}"); return; }
-	get_arg_int(json, "proc", &proc);
-	u32 addr = (u32)strtoul(addr_str, NULL, 16);
-
-	if (strcmp(type_str, "execute") == 0) {
-		std::vector<u32>* bp = (proc != 0) ? NDS_ARM7.breakPoints : NDS_ARM9.breakPoints;
-		if (!bp) { snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: CPU breakpoints not ready\"}]}"); return; }
-		for (size_t i = 0; i < bp->size(); i++) {
-			if ((*bp)[i] == addr) { bp->erase(bp->begin() + (std::ptrdiff_t)i); snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: cleared\"}]}"); return; }
-		}
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"no such breakpoint\"}]}");
-	} else if (strcmp(type_str, "read") == 0) {
-		for (size_t i = 0; i < memReadBreakPoints.size(); i++) {
-			if (memReadBreakPoints[i] == addr) { memReadBreakPoints.erase(memReadBreakPoints.begin() + (std::ptrdiff_t)i); snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: cleared\"}]}"); return; }
-		}
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"no such breakpoint\"}]}");
-	} else if (strcmp(type_str, "write") == 0) {
-		for (size_t i = 0; i < memWriteBreakPoints.size(); i++) {
-			if (memWriteBreakPoints[i] == addr) { memWriteBreakPoints.erase(memWriteBreakPoints.begin() + (std::ptrdiff_t)i); snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: cleared\"}]}"); return; }
-		}
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"no such breakpoint\"}]}");
-	} else {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: type must be execute, read, or write\"}]}");
-	}
-}
-
-static void tool_nds_clear_all_breakpoints(char* result, size_t result_size)
-{
-	if (NDS_ARM9.breakPoints) NDS_ARM9.breakPoints->clear();
-	if (NDS_ARM7.breakPoints) NDS_ARM7.breakPoints->clear();
-	memReadBreakPoints.clear();
-	memWriteBreakPoints.clear();
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: all breakpoints cleared\"}]}");
-}
-
-static void tool_nds_list_breakpoints(char* result, size_t result_size)
-{
-	char buf[2048];
-	char* b = buf;
-	b += sprintf(b, "execute ARM9:");
-	for (size_t i = 0; NDS_ARM9.breakPoints && i < NDS_ARM9.breakPoints->size(); i++)
-		b += sprintf(b, " 0x%08X", (unsigned)(*NDS_ARM9.breakPoints)[i]);
-	b += sprintf(b, " | execute ARM7:");
-	for (size_t i = 0; NDS_ARM7.breakPoints && i < NDS_ARM7.breakPoints->size(); i++)
-		b += sprintf(b, " 0x%08X", (unsigned)(*NDS_ARM7.breakPoints)[i]);
-	b += sprintf(b, " | read:");
-	for (size_t i = 0; i < memReadBreakPoints.size(); i++)
-		b += sprintf(b, " 0x%08X", (unsigned)memReadBreakPoints[i]);
-	b += sprintf(b, " | write:");
-	for (size_t i = 0; i < memWriteBreakPoints.size(); i++)
-		b += sprintf(b, " 0x%08X", (unsigned)memWriteBreakPoints[i]);
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}", buf);
-}
-
-static void convert_native15_to_rgb24(const u16* src, u8* dst, int pixel_count)
-{
-	for (int i = 0; i < pixel_count; i++) {
-		u16 p = src[i];
-		dst[i * 3 + 0] = (u8)(((p >> 0) & 0x1f) << 3);
-		dst[i * 3 + 1] = (u8)(((p >> 5) & 0x1f) << 3);
-		dst[i * 3 + 2] = (u8)(((p >> 10) & 0x1f) << 3);
-	}
-}
-
-static std::vector<u8> build_bmp24(const u8* rgb, int width, int height)
-{
-	const int row_stride = ((width * 3 + 3) / 4) * 4;
-	const int data_size = row_stride * height;
-	const int file_size = 54 + data_size;
-	std::vector<u8> bmp((size_t)file_size, 0);
+	const int rowStride = ((width * 3 + 3) / 4) * 4;
+	const int dataSize = rowStride * height;
+	const int fileSize = 54 + dataSize;
+	std::vector<u8> bmp((size_t)fileSize, 0);
 
 	bmp[0] = 'B';
 	bmp[1] = 'M';
-	*(u32*)&bmp[2] = (u32)file_size;
-	*(u32*)&bmp[10] = 54;
-	*(u32*)&bmp[14] = 40;
-	*(u32*)&bmp[18] = (u32)width;
-	*(u32*)&bmp[22] = (u32)height;
-	*(u16*)&bmp[26] = 1;
-	*(u16*)&bmp[28] = 24;
-	*(u32*)&bmp[34] = (u32)data_size;
+	*(u32 *)&bmp[2] = (u32)fileSize;
+	*(u32 *)&bmp[10] = 54;
+	*(u32 *)&bmp[14] = 40;
+	*(u32 *)&bmp[18] = (u32)width;
+	*(u32 *)&bmp[22] = (u32)height;
+	*(u16 *)&bmp[26] = 1;
+	*(u16 *)&bmp[28] = 24;
+	*(u32 *)&bmp[34] = (u32)dataSize;
 
-	u8* dst = &bmp[54];
-	for (int y = height - 1; y >= 0; y--) {
-		const u8* src_row = rgb + (size_t)y * (size_t)width * 3;
-		memcpy(dst, src_row, (size_t)width * 3);
+	u8 *dst = &bmp[54];
+	for (int y = height - 1; y >= 0; y--)
+	{
+		const u8 *srcRow = rgb + (size_t)y * (size_t)width * 3;
+		//BMP stores BGR
+		for (int x = 0; x < width; x++)
+		{
+			dst[x * 3 + 0] = srcRow[x * 3 + 2];
+			dst[x * 3 + 1] = srcRow[x * 3 + 1];
+			dst[x * 3 + 2] = srcRow[x * 3 + 0];
+		}
 		dst += width * 3;
-		for (int pad = row_stride - width * 3; pad > 0; pad--)
+		for (int pad = rowStride - width * 3; pad > 0; pad--)
 			*dst++ = 0;
 	}
+
 	return bmp;
 }
 
-static bool save_bmp_file(const char* path, const u8* rgb, int width, int height)
+static void PNGAppendU32(std::vector<u8> &out, u32 value)
 {
-	std::vector<u8> bmp = build_bmp24(rgb, width, height);
-	FILE* fp = fopen(path, "wb");
-	if (!fp) return false;
-	size_t wrote = fwrite(&bmp[0], 1, bmp.size(), fp);
+	out.push_back((u8)((value >> 24) & 0xFF));
+	out.push_back((u8)((value >> 16) & 0xFF));
+	out.push_back((u8)((value >> 8) & 0xFF));
+	out.push_back((u8)(value & 0xFF));
+}
+
+static void PNGAppendChunk(std::vector<u8> &out, const char *type, const u8 *data, size_t length)
+{
+	PNGAppendU32(out, (u32)length);
+
+	const size_t crcStart = out.size();
+	out.insert(out.end(), type, type + 4);
+	if (length > 0)
+		out.insert(out.end(), data, data + length);
+
+	uLong crc = crc32(0L, Z_NULL, 0);
+	crc = crc32(crc, &out[crcStart], (uInt)(4 + length));
+	PNGAppendU32(out, (u32)crc);
+}
+
+/* Returns an empty vector when compression fails. */
+static std::vector<u8> BuildPNG24(const u8 *rgb, int width, int height)
+{
+	std::vector<u8> png;
+
+	//raw scanlines, each prefixed with filter type 0
+	std::vector<u8> raw((size_t)height * ((size_t)width * 3 + 1));
+	for (int y = 0; y < height; y++)
+	{
+		u8 *row = &raw[(size_t)y * ((size_t)width * 3 + 1)];
+		row[0] = 0;
+		memcpy(row + 1, rgb + (size_t)y * (size_t)width * 3, (size_t)width * 3);
+	}
+
+	uLongf compressedSize = compressBound((uLong)raw.size());
+	std::vector<u8> compressed((size_t)compressedSize);
+	if (compress2(&compressed[0], &compressedSize, &raw[0], (uLong)raw.size(), Z_DEFAULT_COMPRESSION) != Z_OK)
+		return png;
+	compressed.resize((size_t)compressedSize);
+
+	static const u8 signature[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+	png.insert(png.end(), signature, signature + 8);
+
+	u8 ihdr[13];
+	ihdr[0] = (u8)((width >> 24) & 0xFF);
+	ihdr[1] = (u8)((width >> 16) & 0xFF);
+	ihdr[2] = (u8)((width >> 8) & 0xFF);
+	ihdr[3] = (u8)(width & 0xFF);
+	ihdr[4] = (u8)((height >> 24) & 0xFF);
+	ihdr[5] = (u8)((height >> 16) & 0xFF);
+	ihdr[6] = (u8)((height >> 8) & 0xFF);
+	ihdr[7] = (u8)(height & 0xFF);
+	ihdr[8] = 8;  //bit depth
+	ihdr[9] = 2;  //color type: truecolor
+	ihdr[10] = 0; //compression
+	ihdr[11] = 0; //filter
+	ihdr[12] = 0; //interlace
+	PNGAppendChunk(png, "IHDR", ihdr, sizeof(ihdr));
+	PNGAppendChunk(png, "IDAT", &compressed[0], compressed.size());
+	PNGAppendChunk(png, "IEND", NULL, 0);
+
+	return png;
+}
+
+static bool WriteFileBytes(const char *path, const u8 *data, size_t length)
+{
+	FILE *fp = fopen(path, "wb");
+	if (fp == NULL)
+		return false;
+	const size_t written = fwrite(data, 1, length, fp);
 	fclose(fp);
-	return wrote == bmp.size();
+	return (written == length);
 }
 
-static void tool_nds_screenshot(const char* json, std::string& result)
+static bool HasExtension(const std::string &path, const char *extension)
 {
-	if (!GPU) {
-		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: GPU not ready\"}]}";
-		return;
+	const size_t extensionLength = strlen(extension);
+	if (path.size() < extensionLength)
+		return false;
+	for (size_t i = 0; i < extensionLength; i++)
+	{
+		const char a = (char)tolower((unsigned char)path[path.size() - extensionLength + i]);
+		if (a != extension[i])
+			return false;
 	}
-
-	char screen[16] = "both";
-	char path[512] = {0};
-	get_arg_str(json, "screen", screen, sizeof(screen));
-	get_arg_str(json, "path", path, sizeof(path));
-
-	const NDSDisplayInfo& disp = GPU->GetDisplayInfo();
-	const u16* fb = disp.masterNativeBuffer16;
-	if (!fb) {
-		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: no framebuffer\"}]}";
-		return;
-	}
-
-	const int full_w = GPU_FRAMEBUFFER_NATIVE_WIDTH;
-	const int screen_h = GPU_FRAMEBUFFER_NATIVE_HEIGHT;
-	const int full_h = screen_h * 2;
-	const int pixels_per_screen = full_w * screen_h;
-
-	const u16* src = fb;
-	int width = full_w;
-	int height = full_h;
-
-	if (str_ieq(screen, "main")) {
-		height = screen_h;
-	} else if (str_ieq(screen, "touch")) {
-		src = fb + pixels_per_screen;
-		height = screen_h;
-	} else if (!str_ieq(screen, "both")) {
-		result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: screen must be both, main, or touch\"}]}";
-		return;
-	}
-
-	const int pixel_count = width * height;
-	std::vector<u8> rgb((size_t)pixel_count * 3);
-	convert_native15_to_rgb24(src, &rgb[0], pixel_count);
-
-	if (path[0]) {
-		if (!save_bmp_file(path, &rgb[0], width, height)) {
-			result = "{\"content\":[{\"type\":\"text\",\"text\":\"error: failed to write BMP\"}]}";
-			return;
-		}
-		char msg[640];
-		snprintf(msg, sizeof(msg), "OK: saved %dx%d BMP to %s", width, height, path);
-		char escaped[640];
-		escape_json_string(msg, escaped, sizeof(escaped));
-		result = std::string("{\"content\":[{\"type\":\"text\",\"text\":\"") + escaped + "\"}]}";
-		return;
-	}
-
-	std::vector<u8> bmp = build_bmp24(&rgb[0], width, height);
-	std::string b64 = base64_encode(&bmp[0], bmp.size());
-	char dim[64];
-	snprintf(dim, sizeof(dim), "%dx%d", width, height);
-	char dim_esc[64];
-	escape_json_string(dim, dim_esc, sizeof(dim_esc));
-
-	result.reserve(64 + b64.size());
-	result = "{\"content\":[{\"type\":\"image\",\"data\":\"";
-	result += b64;
-	result += "\",\"mimeType\":\"image/bmp\"},{\"type\":\"text\",\"text\":\"";
-	result += dim_esc;
-	result += "\"}]}";
-}
-
-static bool set_button_by_name(UserButtons& buttons, const char* name, bool pressed)
-{
-	if (str_ieq(name, "A")) buttons.A = pressed;
-	else if (str_ieq(name, "B")) buttons.B = pressed;
-	else if (str_ieq(name, "X")) buttons.X = pressed;
-	else if (str_ieq(name, "Y")) buttons.Y = pressed;
-	else if (str_ieq(name, "start")) buttons.S = pressed;
-	else if (str_ieq(name, "select")) buttons.T = pressed;
-	else if (str_ieq(name, "up")) buttons.U = pressed;
-	else if (str_ieq(name, "down")) buttons.D = pressed;
-	else if (str_ieq(name, "left")) buttons.L = pressed;
-	else if (str_ieq(name, "right")) buttons.R = pressed;
-	else if (str_ieq(name, "L")) buttons.W = pressed;
-	else if (str_ieq(name, "R")) buttons.E = pressed;
-	else if (str_ieq(name, "debug")) buttons.G = pressed;
-	else if (str_ieq(name, "lid")) buttons.F = pressed;
-	else return false;
 	return true;
 }
 
-static void apply_user_buttons(const UserButtons& buttons)
+//---------------------------------------------------------------------------
+// Tools
+//---------------------------------------------------------------------------
+
+static int ProcessorFromArgs(const mcpjson::Value &args)
+{
+	const mcpjson::Value *proc = args.Find("proc");
+	if (proc == NULL || proc->IsNull())
+		return 0;
+	if (proc->IsString())
+	{
+		const std::string name = proc->str;
+		if (name == "7" || name == "arm7" || name == "ARM7")
+			return 1;
+		return 0;
+	}
+	return (proc->AsInt() != 0) ? 1 : 0;
+}
+
+static armcpu_t& CPUFromArgs(const mcpjson::Value &args)
+{
+	return (ProcessorFromArgs(args) != 0) ? NDS_ARM7 : NDS_ARM9;
+}
+
+static bool IsROMLoaded()
+{
+	return (gameInfo.reader != NULL);
+}
+
+/*
+	Runs frames on the calling (emulation) thread and returns how many actually ran.
+
+	A paused emulator has its CPUs stalled, so running frames has to lift that first,
+	otherwise the frame counter would advance without a single instruction executing.
+	A memory breakpoint clears the global execute flag, which ends the run early.
+*/
+static void SetExecute(bool run)
+{
+	if (g_setExecute != NULL)
+		g_setExecute(run ? 1 : 0);
+	else
+		execute = run;
+}
+
+static int RunFrames(int frames)
+{
+	//a pause can be either of these, and both have to be lifted for a frame to run
+	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
+	const bool wasRunning = (g_getExecute != NULL) ? (g_getExecute() != 0) : execute;
+
+	if (wasStalled)
+		NDS_debug_continue();
+	SetExecute(true);
+
+	int ran = 0;
+	for (int i = 0; i < frames; i++)
+	{
+		NDS_exec<false>();
+		SPU_Emulate_user();
+		ran++;
+
+		if (!execute)
+			break;  //a breakpoint stopped us
+	}
+
+	const bool stoppedByBreakpoint = !execute;
+
+	if (wasStalled && !stoppedByBreakpoint)
+		NDS_debug_break();
+	if (!wasRunning || stoppedByBreakpoint)
+		SetExecute(false);
+
+	return ran;
+}
+
+static std::string ToolGetState()
+{
+	const bool running = (g_getExecute != NULL) ? (g_getExecute() != 0) : false;
+
+	std::string text = Format(
+		"running=%s rom_loaded=%s frame=%d\n"
+		"ARM9: PC=0x%08X CPSR=0x%08X %s\n"
+		"ARM7: PC=0x%08X CPSR=0x%08X %s",
+		running ? "true" : "false",
+		IsROMLoaded() ? "true" : "false",
+		currFrameCounter,
+		(unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM9.CPSR.val, NDS_ARM9.CPSR.bits.T ? "thumb" : "arm",
+		(unsigned)NDS_ARM7.instruct_adr, (unsigned)NDS_ARM7.CPSR.val, NDS_ARM7.CPSR.bits.T ? "thumb" : "arm");
+
+	if (IsROMLoaded())
+		text += Format("\nROM: title=%s serial=%s size=%u", gameInfo.ROMname, gameInfo.ROMserial, (unsigned)gameInfo.romsize);
+
+	return TextResult(text);
+}
+
+static std::string ToolPause()
+{
+	if (g_setExecute != NULL)
+		g_setExecute(0);
+	NDS_debug_break();
+	return TextResult("paused");
+}
+
+static std::string ToolResume()
+{
+	if (g_setExecute != NULL)
+		g_setExecute(1);
+	NDS_debug_continue();
+	return TextResult("running");
+}
+
+static std::string ToolStep(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	long count = args.GetInt("count", 1);
+	if (count < 1) count = 1;
+	if (count > 1000) count = 1000;
+
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+
+	//a paused emulator has its CPUs stalled, which would keep them from executing
+	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
+	if (wasStalled)
+		NDS_debug_continue();
+
+	/*
+		debugStep makes the CPU loop run a single instruction on that core and then
+		drop the global execute flag, which ends the frame early. That is the same
+		mechanism the Windows debugger steps with.
+	*/
+	long stepped = 0;
+	for (long i = 0; i < count; i++)
+	{
+		cpu.debugStep = true;
+		SetExecute(true);
+
+		NDS_exec<false>();
+		SPU_Emulate_user();
+
+		if (cpu.debugStep)
+		{
+			//the core never got to run: it is halted or waiting for an interrupt
+			cpu.debugStep = false;
+			break;
+		}
+
+		stepped++;
+	}
+
+	//leave nothing armed behind, or the next run would be cut short
+	NDS_ARM9.debugStep = false;
+	NDS_ARM7.debugStep = false;
+
+	if (wasStalled)
+		NDS_debug_break();
+	SetExecute(false);
+
+	std::string text = Format("stepped %ld instruction(s) on ARM%d; ARM9 PC=0x%08X ARM7 PC=0x%08X",
+		stepped, (proc != 0) ? 7 : 9, (unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM7.instruct_adr);
+	if (stepped < count)
+		text += " (stopped early: the CPU is halted)";
+
+	return TextResult(text);
+}
+
+static std::string ToolRunFrames(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	long frames = args.GetInt("frames", 1);
+	if (frames < 1) frames = 1;
+	if (frames > MAX_RUN_FRAMES) frames = MAX_RUN_FRAMES;
+
+	const int ran = RunFrames((int)frames);
+
+	std::string text = Format("ran %d frame(s); frame=%d ARM9 PC=0x%08X", ran, currFrameCounter, (unsigned)NDS_ARM9.instruct_adr);
+	if (ran < frames)
+		text += " (stopped early: a breakpoint paused emulation)";
+
+	return TextResult(text);
+}
+
+static std::string ToolReset()
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+	NDS_Reset();
+	return TextResult("reset");
+}
+
+static std::string ToolQuit()
+{
+	g_quitRequested = true;
+	if (g_setExecute != NULL)
+		g_setExecute(0);
+	return TextResult("shutting down");
+}
+
+static std::string ToolLoadROM(const mcpjson::Value &args)
+{
+	const std::string path = args.GetString("path");
+	if (path.empty())
+		return ErrorResult("missing path");
+
+	const int result = NDS_LoadROM(path.c_str(), NULL, NULL);
+	if (result < 0)
+		return ErrorResult(Format("failed to load %s (error %d)", path.c_str(), result));
+
+	return TextResult(Format("loaded %s (title=%s serial=%s)", path.c_str(), gameInfo.ROMname, gameInfo.ROMserial));
+}
+
+static std::string ToolReloadROM()
+{
+	const char *path = NDS_GetLastRomPath();
+	if (path == NULL || path[0] == '\0')
+		return ErrorResult("no ROM loaded to reload");
+
+	const int result = NDS_LoadROM(path, NULL, NULL);
+	if (result < 0)
+		return ErrorResult(Format("failed to reload %s (error %d)", path, result));
+
+	return TextResult(Format("reloaded %s", path));
+}
+
+static std::string ToolGetROMInfo()
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	const NDS_header *header = NDS_getROMHeader();
+	std::string text = Format("title=%s serial=%s size=%u", gameInfo.ROMname, gameInfo.ROMserial, (unsigned)gameInfo.romsize);
+	if (header != NULL)
+	{
+		char gameCode[5];
+		memcpy(gameCode, header->gameCode, 4);
+		gameCode[4] = '\0';
+		text += Format(" code=%s maker=0x%04X version=%u arm9_entry=0x%08X arm7_entry=0x%08X",
+			gameCode,
+			(unsigned)header->makerCode, (unsigned)header->romversion,
+			(unsigned)header->ARM9exe, (unsigned)header->ARM7exe);
+	}
+	const char *path = NDS_GetLastRomPath();
+	if (path != NULL && path[0] != '\0')
+		text += Format(" path=%s", path);
+
+	return TextResult(text);
+}
+
+static std::string ToolReadMemory(const mcpjson::Value &args)
+{
+	u32 address = 0;
+	if (!args.GetAddress("address", address))
+		return ErrorResult("missing or malformed address");
+
+	const int proc = ProcessorFromArgs(args);
+	long size = args.GetInt("size", 16);
+	if (size < 1) size = 1;
+	if ((size_t)size > MAX_MEMORY_READ)
+		size = (long)MAX_MEMORY_READ;
+
+	std::vector<u8> bytes((size_t)size);
+	for (long i = 0; i < size; i++)
+		bytes[(size_t)i] = _MMU_read08(proc, MMU_AT_DEBUG, address + (u32)i);
+
+	//classic hex dump: 16 bytes per line with an ASCII column
+	std::string text;
+	for (long offset = 0; offset < size; offset += 16)
+	{
+		text += Format("%08X:", (unsigned)(address + (u32)offset));
+
+		const long lineLength = ((size - offset) < 16) ? (size - offset) : 16;
+		for (long i = 0; i < 16; i++)
+		{
+			if (i < lineLength)
+				text += Format(" %02X", (unsigned)bytes[(size_t)(offset + i)]);
+			else
+				text += "   ";
+		}
+
+		text += "  ";
+		for (long i = 0; i < lineLength; i++)
+		{
+			const u8 value = bytes[(size_t)(offset + i)];
+			text.push_back((value >= 0x20 && value < 0x7F) ? (char)value : '.');
+		}
+
+		if (offset + 16 < size)
+			text.push_back('\n');
+	}
+
+	return TextResult(text);
+}
+
+static bool ParseHexBytes(const std::string &text, std::vector<u8> &out)
+{
+	std::string compact;
+	for (size_t i = 0; i < text.size(); i++)
+	{
+		const char c = text[i];
+		if (c == ' ' || c == '\t' || c == ',' || c == '\n' || c == '\r')
+			continue;
+		compact.push_back(c);
+	}
+
+	if (compact.size() >= 2 && compact[0] == '0' && (compact[1] == 'x' || compact[1] == 'X'))
+		compact.erase(0, 2);
+
+	if (compact.empty() || (compact.size() % 2) != 0)
+		return false;
+
+	out.clear();
+	out.reserve(compact.size() / 2);
+	for (size_t i = 0; i < compact.size(); i += 2)
+	{
+		char byteText[3] = { compact[i], compact[i + 1], '\0' };
+		char *endPtr = NULL;
+		const unsigned long value = strtoul(byteText, &endPtr, 16);
+		if (endPtr != byteText + 2)
+			return false;
+		out.push_back((u8)value);
+	}
+
+	return true;
+}
+
+static std::string ToolWriteMemory(const mcpjson::Value &args)
+{
+	u32 address = 0;
+	if (!args.GetAddress("address", address))
+		return ErrorResult("missing or malformed address");
+
+	const int proc = ProcessorFromArgs(args);
+
+	std::vector<u8> bytes;
+	const mcpjson::Value *value = args.Find("value");
+	if (value == NULL || value->IsNull())
+		return ErrorResult("missing value");
+
+	if (value->IsArray())
+	{
+		for (size_t i = 0; i < value->items.size(); i++)
+			bytes.push_back((u8)value->items[i].AsInt());
+	}
+	else if (value->IsNumber())
+	{
+		//a bare number is written using the requested width, little endian
+		long width = args.GetInt("size", 4);
+		if (width != 1 && width != 2 && width != 4)
+			width = 4;
+		const u32 raw = (u32)value->AsInt();
+		for (long i = 0; i < width; i++)
+			bytes.push_back((u8)((raw >> (8 * i)) & 0xFF));
+	}
+	else if (!ParseHexBytes(value->AsString(), bytes))
+	{
+		return ErrorResult("value must be an even length hex string, a number, or an array of bytes");
+	}
+
+	if (bytes.empty())
+		return ErrorResult("nothing to write");
+	if (bytes.size() > MAX_MEMORY_READ)
+		return ErrorResult(Format("refusing to write more than %u bytes at once", (unsigned)MAX_MEMORY_READ));
+
+	for (size_t i = 0; i < bytes.size(); i++)
+		_MMU_write08(proc, MMU_AT_DEBUG, address + (u32)i, bytes[i]);
+
+	return TextResult(Format("wrote %u byte(s) to 0x%08X on ARM%d", (unsigned)bytes.size(), (unsigned)address, (proc != 0) ? 7 : 9));
+}
+
+static std::string ToolSearchMemory(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	const int proc = ProcessorFromArgs(args);
+
+	std::vector<u8> pattern;
+	const mcpjson::Value *value = args.Find("value");
+	if (value == NULL || value->IsNull())
+		return ErrorResult("missing value");
+
+	if (value->IsNumber())
+	{
+		long width = args.GetInt("size", 4);
+		if (width != 1 && width != 2 && width != 4)
+			width = 4;
+		const u32 raw = (u32)value->AsInt();
+		for (long i = 0; i < width; i++)
+			pattern.push_back((u8)((raw >> (8 * i)) & 0xFF));
+	}
+	else if (value->IsString() && !ParseHexBytes(value->str, pattern))
+	{
+		return ErrorResult("value must be a hex byte string or a number");
+	}
+	else if (value->IsArray())
+	{
+		for (size_t i = 0; i < value->items.size(); i++)
+			pattern.push_back((u8)value->items[i].AsInt());
+	}
+
+	if (pattern.empty())
+		return ErrorResult("empty search pattern");
+
+	u32 start = 0x02000000;
+	u32 end = 0x02400000;
+	args.GetAddress("start", start);
+	args.GetAddress("end", end);
+	if (end <= start)
+		return ErrorResult("end must be greater than start");
+	if ((end - start) > 0x01000000)
+		return ErrorResult("search range is limited to 16 MiB");
+
+	long maxResults = args.GetInt("max_results", 32);
+	if (maxResults < 1) maxResults = 1;
+	if (maxResults > 256) maxResults = 256;
+
+	std::vector<u32> hits;
+	const u32 last = end - (u32)pattern.size();
+	for (u32 address = start; address <= last; address++)
+	{
+		size_t i = 0;
+		while (i < pattern.size() && _MMU_read08(proc, MMU_AT_DEBUG, address + (u32)i) == pattern[i])
+			i++;
+		if (i == pattern.size())
+		{
+			hits.push_back(address);
+			if ((long)hits.size() >= maxResults)
+				break;
+		}
+	}
+
+	if (hits.empty())
+		return TextResult("no matches");
+
+	std::string text = Format("%u match(es):", (unsigned)hits.size());
+	for (size_t i = 0; i < hits.size(); i++)
+		text += Format(" 0x%08X", (unsigned)hits[i]);
+	if ((long)hits.size() >= maxResults)
+		text += " (truncated)";
+
+	return TextResult(text);
+}
+
+static std::string ToolGetRegisters(const mcpjson::Value &args)
+{
+	const armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+
+	std::string text = Format("ARM%d PC=0x%08X CPSR=0x%08X (%s, mode=0x%02X) next=0x%08X\n",
+		(proc != 0) ? 7 : 9,
+		(unsigned)cpu.instruct_adr, (unsigned)cpu.CPSR.val,
+		cpu.CPSR.bits.T ? "thumb" : "arm", (unsigned)cpu.CPSR.bits.mode,
+		(unsigned)cpu.next_instruction);
+
+	for (int i = 0; i < 16; i++)
+	{
+		text += Format("R%-2d=0x%08X", i, (unsigned)cpu.R[i]);
+		text += ((i % 4) == 3) ? "\n" : "  ";
+	}
+	text += Format("SPSR=0x%08X", (unsigned)cpu.SPSR.val);
+
+	return TextResult(text);
+}
+
+static std::string ToolSetRegister(const mcpjson::Value &args)
+{
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+
+	std::string name = args.GetString("register");
+	if (name.empty())
+		return ErrorResult("missing register (R0-R15, PC, SP, LR, CPSR)");
+	for (size_t i = 0; i < name.size(); i++)
+		name[i] = (char)toupper((unsigned char)name[i]);
+
+	u32 value = 0;
+	if (!args.GetAddress("value", value))
+		return ErrorResult("missing or malformed value");
+
+	int index = -1;
+	if (name == "PC") index = 15;
+	else if (name == "SP") index = 13;
+	else if (name == "LR") index = 14;
+	else if (name == "CPSR")
+	{
+		cpu.CPSR.val = value;
+		return TextResult(Format("ARM%d CPSR=0x%08X", (proc != 0) ? 7 : 9, (unsigned)value));
+	}
+	else if (name.size() >= 2 && name[0] == 'R')
+	{
+		index = (int)strtol(name.c_str() + 1, NULL, 10);
+	}
+
+	if (index < 0 || index > 15)
+		return ErrorResult("register must be one of R0-R15, PC, SP, LR, CPSR");
+
+	cpu.R[index] = value;
+	if (index == 15)
+	{
+		//keep the fetch state in sync with the new PC
+		const u32 instructionSize = cpu.CPSR.bits.T ? 2 : 4;
+		cpu.instruct_adr = value;
+		cpu.next_instruction = value;
+		cpu.R[15] = value + instructionSize;
+	}
+
+	return TextResult(Format("ARM%d %s=0x%08X", (proc != 0) ? 7 : 9, name.c_str(), (unsigned)value));
+}
+
+static std::string ToolDisassemble(const mcpjson::Value &args)
+{
+	const armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+
+	u32 address = cpu.instruct_adr;
+	args.GetAddress("address", address);
+
+	long count = args.GetInt("count", 8);
+	if (count < 1) count = 1;
+	if (count > 128) count = 128;
+
+	bool thumb = (cpu.CPSR.bits.T != 0);
+	const mcpjson::Value *thumbArg = args.Find("thumb");
+	if (thumbArg != NULL && !thumbArg->IsNull())
+		thumb = args.GetBool("thumb", thumb);
+
+	std::string text;
+	for (long i = 0; i < count; i++)
+	{
+		char disassembly[128] = { 0 };
+
+		if (thumb)
+		{
+			const u16 opcode = (u16)(_MMU_read08(proc, MMU_AT_DEBUG, address) |
+				((u16)_MMU_read08(proc, MMU_AT_DEBUG, address + 1) << 8));
+			des_thumb_instructions_set[(opcode >> 6) & 1023](address, opcode, disassembly);
+			text += Format("%08X  %04X      %s", (unsigned)address, (unsigned)opcode, disassembly);
+			address += 2;
+		}
+		else
+		{
+			u32 opcode = 0;
+			for (int b = 0; b < 4; b++)
+				opcode |= ((u32)_MMU_read08(proc, MMU_AT_DEBUG, address + (u32)b)) << (8 * b);
+			des_arm_instructions_set[INSTRUCTION_INDEX(opcode)](address, opcode, disassembly);
+			text += Format("%08X  %08X  %s", (unsigned)address, (unsigned)opcode, disassembly);
+			address += 4;
+		}
+
+		if (i + 1 < count)
+			text.push_back('\n');
+	}
+
+	return TextResult(text);
+}
+
+static std::vector<u32>* ExecuteBreakpointList(int proc)
+{
+	return (proc != 0) ? NDS_ARM7.breakPoints : NDS_ARM9.breakPoints;
+}
+
+static std::string ToolSetBreakpoint(const mcpjson::Value &args)
+{
+	const std::string type = args.GetString("type", "execute");
+	u32 address = 0;
+	if (!args.GetAddress("address", address))
+		return ErrorResult("missing or malformed address");
+
+	const int proc = ProcessorFromArgs(args);
+	std::vector<u32> *list = NULL;
+
+	if (type == "execute")
+	{
+		list = ExecuteBreakpointList(proc);
+		if (list == NULL)
+			return ErrorResult("CPU breakpoint list is not available yet");
+	}
+	else if (type == "read")
+	{
+		list = &memReadBreakPoints;
+	}
+	else if (type == "write")
+	{
+		list = &memWriteBreakPoints;
+	}
+	else
+	{
+		return ErrorResult("type must be execute, read, or write");
+	}
+
+	if (std::find(list->begin(), list->end(), address) != list->end())
+		return TextResult(Format("%s breakpoint at 0x%08X was already set", type.c_str(), (unsigned)address));
+
+	list->push_back(address);
+
+	if (type == "execute")
+	{
+		std::string text = Format("execute breakpoint at 0x%08X on ARM%d", (unsigned)address, (proc != 0) ? 7 : 9);
+#if !defined(HOST_WINDOWS) || defined(TARGET_INTERFACE)
+		//only the Windows frontend checks these in the CPU loop
+		text += " (recorded, but this build only enforces read and write breakpoints)";
+#endif
+		return TextResult(text);
+	}
+	return TextResult(Format("%s breakpoint at 0x%08X", type.c_str(), (unsigned)address));
+}
+
+static std::string ToolClearBreakpoint(const mcpjson::Value &args)
+{
+	const std::string type = args.GetString("type", "execute");
+	u32 address = 0;
+	if (!args.GetAddress("address", address))
+		return ErrorResult("missing or malformed address");
+
+	const int proc = ProcessorFromArgs(args);
+	std::vector<u32> *list = NULL;
+
+	if (type == "execute")
+	{
+		list = ExecuteBreakpointList(proc);
+		if (list == NULL)
+			return ErrorResult("CPU breakpoint list is not available yet");
+	}
+	else if (type == "read")
+		list = &memReadBreakPoints;
+	else if (type == "write")
+		list = &memWriteBreakPoints;
+	else
+		return ErrorResult("type must be execute, read, or write");
+
+	const std::vector<u32>::iterator it = std::find(list->begin(), list->end(), address);
+	if (it == list->end())
+		return TextResult(Format("no %s breakpoint at 0x%08X", type.c_str(), (unsigned)address));
+
+	list->erase(it);
+	return TextResult(Format("cleared %s breakpoint at 0x%08X", type.c_str(), (unsigned)address));
+}
+
+static std::string ToolClearAllBreakpoints()
+{
+	if (NDS_ARM9.breakPoints != NULL) NDS_ARM9.breakPoints->clear();
+	if (NDS_ARM7.breakPoints != NULL) NDS_ARM7.breakPoints->clear();
+	memReadBreakPoints.clear();
+	memWriteBreakPoints.clear();
+	return TextResult("all breakpoints cleared");
+}
+
+static void AppendBreakpointList(std::string &text, const char *label, const std::vector<u32> *list)
+{
+	text += label;
+	if (list == NULL || list->empty())
+	{
+		text += " (none)";
+		return;
+	}
+	for (size_t i = 0; i < list->size(); i++)
+		text += Format(" 0x%08X", (unsigned)(*list)[i]);
+}
+
+static std::string ToolListBreakpoints()
+{
+	std::string text;
+	AppendBreakpointList(text, "execute ARM9:", NDS_ARM9.breakPoints);
+	text.push_back('\n');
+	AppendBreakpointList(text, "execute ARM7:", NDS_ARM7.breakPoints);
+	text.push_back('\n');
+	AppendBreakpointList(text, "read:", &memReadBreakPoints);
+	text.push_back('\n');
+	AppendBreakpointList(text, "write:", &memWriteBreakPoints);
+	return TextResult(text);
+}
+
+static std::string ToolSaveState(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	const std::string path = args.GetString("path");
+	if (!path.empty())
+	{
+		if (!savestate_save(path.c_str()))
+			return ErrorResult(Format("failed to write savestate to %s", path.c_str()));
+		return TextResult(Format("saved state to %s", path.c_str()));
+	}
+
+	const mcpjson::Value *slot = args.Find("slot");
+	if (slot == NULL || slot->IsNull())
+		return ErrorResult("provide either path or slot");
+
+	const long slotNumber = slot->AsInt();
+	if (slotNumber < 0 || slotNumber >= NB_STATES)
+		return ErrorResult(Format("slot must be between 0 and %d", NB_STATES - 1));
+
+	savestate_slot((int)slotNumber);
+	return TextResult(Format("saved state to slot %ld", slotNumber));
+}
+
+static std::string ToolLoadState(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	const std::string path = args.GetString("path");
+	if (!path.empty())
+	{
+		if (!savestate_load(path.c_str()))
+			return ErrorResult(Format("failed to load savestate from %s", path.c_str()));
+		return TextResult(Format("loaded state from %s", path.c_str()));
+	}
+
+	const mcpjson::Value *slot = args.Find("slot");
+	if (slot == NULL || slot->IsNull())
+		return ErrorResult("provide either path or slot");
+
+	const long slotNumber = slot->AsInt();
+	if (slotNumber < 0 || slotNumber >= NB_STATES)
+		return ErrorResult(Format("slot must be between 0 and %d", NB_STATES - 1));
+
+	loadstate_slot((int)slotNumber);
+	return TextResult(Format("loaded state from slot %ld", slotNumber));
+}
+
+static std::string ToolScreenshot(const mcpjson::Value &args)
+{
+	if (GPU == NULL)
+		return ErrorResult("GPU is not initialized");
+
+	const NDSDisplayInfo &displayInfo = GPU->GetDisplayInfo();
+	const u16 *frameBuffer = displayInfo.masterNativeBuffer16;
+	if (frameBuffer == NULL)
+		return ErrorResult("no framebuffer available");
+
+	const std::string screen = args.GetString("screen", "both");
+	const std::string path = args.GetString("path");
+	std::string format = args.GetString("format", "png");
+	for (size_t i = 0; i < format.size(); i++)
+		format[i] = (char)tolower((unsigned char)format[i]);
+
+	const int screenWidth = GPU_FRAMEBUFFER_NATIVE_WIDTH;
+	const int screenHeight = GPU_FRAMEBUFFER_NATIVE_HEIGHT;
+	const size_t pixelsPerScreen = (size_t)screenWidth * (size_t)screenHeight;
+
+	const u16 *source = frameBuffer;
+	int width = screenWidth;
+	int height = screenHeight * 2;
+
+	if (screen == "main" || screen == "top")
+	{
+		height = screenHeight;
+	}
+	else if (screen == "touch" || screen == "bottom")
+	{
+		source = frameBuffer + pixelsPerScreen;
+		height = screenHeight;
+	}
+	else if (screen != "both")
+	{
+		return ErrorResult("screen must be both, main, or touch");
+	}
+
+	std::vector<u8> rgb((size_t)width * (size_t)height * 3);
+	ConvertNative15ToRGB24(source, &rgb[0], (size_t)width * (size_t)height);
+
+	//an explicit extension in the output path wins over the format argument
+	bool wantBMP = (format == "bmp");
+	if (!path.empty())
+	{
+		if (HasExtension(path, ".bmp"))
+			wantBMP = true;
+		else if (HasExtension(path, ".png"))
+			wantBMP = false;
+	}
+
+	std::vector<u8> encoded = wantBMP ? BuildBMP24(&rgb[0], width, height) : BuildPNG24(&rgb[0], width, height);
+	if (encoded.empty())
+		return ErrorResult("failed to encode the screenshot");
+
+	if (!path.empty())
+	{
+		if (!WriteFileBytes(path.c_str(), &encoded[0], encoded.size()))
+			return ErrorResult(Format("failed to write %s", path.c_str()));
+		return TextResult(Format("saved %dx%d %s to %s", width, height, wantBMP ? "BMP" : "PNG", path.c_str()));
+	}
+
+	std::string out("{\"content\":[{\"type\":\"image\",\"data\":\"");
+	out += Base64Encode(&encoded[0], encoded.size());
+	out += "\",\"mimeType\":\"";
+	out += wantBMP ? "image/bmp" : "image/png";
+	out += "\"},{\"type\":\"text\",\"text\":";
+	out += mcpjson::Quote(Format("%dx%d %s (%s screen)", width, height, wantBMP ? "BMP" : "PNG", screen.c_str()));
+	out += "}],\"isError\":false}";
+	return out;
+}
+
+//---------------------------------------------------------------------------
+// Input
+//---------------------------------------------------------------------------
+
+static bool SetButtonByName(UserButtons &buttons, const std::string &name, bool pressed)
+{
+	std::string key;
+	for (size_t i = 0; i < name.size(); i++)
+		key.push_back((char)tolower((unsigned char)name[i]));
+
+	if (key == "a") buttons.A = pressed;
+	else if (key == "b") buttons.B = pressed;
+	else if (key == "x") buttons.X = pressed;
+	else if (key == "y") buttons.Y = pressed;
+	else if (key == "start") buttons.S = pressed;
+	else if (key == "select") buttons.T = pressed;
+	else if (key == "up") buttons.U = pressed;
+	else if (key == "down") buttons.D = pressed;
+	else if (key == "left") buttons.L = pressed;
+	else if (key == "right") buttons.R = pressed;
+	else if (key == "l") buttons.W = pressed;
+	else if (key == "r") buttons.E = pressed;
+	else if (key == "debug") buttons.G = pressed;
+	else if (key == "lid") buttons.F = pressed;
+	else return false;
+
+	return true;
+}
+
+static void ApplyUserButtons(const UserButtons &buttons)
 {
 	NDS_setPad(
 		buttons.R, buttons.L, buttons.D, buttons.U,
 		buttons.T, buttons.S, buttons.B, buttons.A,
 		buttons.Y, buttons.X, buttons.W, buttons.E,
 		buttons.G, buttons.F);
+
 	NDS_beginProcessingInput();
 	NDS_getProcessingUserInput().buttons = buttons;
 	NDS_endProcessingInput();
 }
 
-static u16 clamp_touch_coord(int value, int maximum)
+static u16 ClampTouchCoordinate(long value, int maximum)
 {
 	if (value < 0) value = 0;
 	if (value >= maximum) value = maximum - 1;
 	return (u16)value;
 }
 
-static void apply_user_touch(u16 x, u16 y, bool touch)
+static void ApplyUserTouch(u16 x, u16 y, bool touch)
 {
-	if (touch) {
+	if (touch)
 		NDS_setTouchPos(x, y);
-	} else {
+	else
 		NDS_releaseTouch();
-	}
+
 	NDS_beginProcessingInput();
-	UserTouch& t = NDS_getProcessingUserInput().touch;
-	if (touch) {
-		t.touchX = (u16)((x << 4) & 0x0FF0);
-		t.touchY = (u16)((y << 4) & 0x0FF0);
-		t.isTouch = true;
-	} else {
-		t.touchX = 0;
-		t.touchY = 0;
-		t.isTouch = false;
+	UserTouch &userTouch = NDS_getProcessingUserInput().touch;
+	if (touch)
+	{
+		userTouch.touchX = (u16)((x << 4) & 0x0FF0);
+		userTouch.touchY = (u16)((y << 4) & 0x0FF0);
+		userTouch.isTouch = true;
+	}
+	else
+	{
+		userTouch.touchX = 0;
+		userTouch.touchY = 0;
+		userTouch.isTouch = false;
 	}
 	NDS_endProcessingInput();
 }
 
-static void tool_nds_input_touch(const char* json, char* result, size_t result_size)
+/* Number of frames an input should be held for, 0 when it should simply latch. */
+static int HoldFramesFromArgs(const mcpjson::Value &args)
 {
-	int x = 0, y = 0;
-	int touch_on = 1;
-	if (get_arg_int(json, "x", &x) != 0 || get_arg_int(json, "y", &y) != 0) {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing x or y\"}]}");
-		return;
-	}
-	get_arg_bool(json, "touch", &touch_on, 1);
-
-	if (touch_on) {
-		u16 px = clamp_touch_coord(x, GPU_FRAMEBUFFER_NATIVE_WIDTH);
-		u16 py = clamp_touch_coord(y, GPU_FRAMEBUFFER_NATIVE_HEIGHT);
-		apply_user_touch(px, py, true);
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: touch at (%u,%u)\"}]}", (unsigned)px, (unsigned)py);
-	} else {
-		apply_user_touch(0, 0, false);
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: touch released\"}]}");
-	}
+	long frames = args.GetInt("frames", 0);
+	if (frames < 0) frames = 0;
+	if (frames > MAX_RUN_FRAMES) frames = MAX_RUN_FRAMES;
+	return (int)frames;
 }
 
-static void tool_nds_input_key(const char* json, char* result, size_t result_size)
+static std::string ToolInputKey(const mcpjson::Value &args)
 {
-	char button[32] = {0};
-	if (get_arg_str(json, "button", button, sizeof(button)) != 0) {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: missing button\"}]}");
-		return;
-	}
+	const std::string button = args.GetString("button");
+	if (button.empty())
+		return ErrorResult("missing button (A, B, X, Y, start, select, up, down, left, right, L, R, debug, lid)");
 
-	int pressed = 1;
-	get_arg_bool(json, "pressed", &pressed, 1);
+	const bool pressed = args.GetBool("pressed", true);
+	const int holdFrames = HoldFramesFromArgs(args);
 
 	UserButtons buttons = NDS_getRawUserInput().buttons;
-	if (!set_button_by_name(buttons, button, pressed != 0)) {
-		snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"error: unknown button (A,B,X,Y,start,select,up,down,left,right,L,R,debug,lid)\"}]}");
-		return;
+	if (!SetButtonByName(buttons, button, pressed))
+		return ErrorResult(Format("unknown button '%s'", button.c_str()));
+
+	ApplyUserButtons(buttons);
+
+	if (holdFrames > 0)
+	{
+		if (!IsROMLoaded())
+			return ErrorResult("no ROM loaded, cannot hold an input for a number of frames");
+
+		RunFrames(holdFrames);
+
+		UserButtons released = NDS_getRawUserInput().buttons;
+		SetButtonByName(released, button, !pressed);
+		ApplyUserButtons(released);
+
+		return TextResult(Format("%s held for %d frame(s), then released; frame=%d",
+			button.c_str(), holdFrames, currFrameCounter));
 	}
 
-	apply_user_buttons(buttons);
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: %s %s\"}]}", button, pressed ? "pressed" : "released");
+	return TextResult(Format("%s %s", button.c_str(), pressed ? "pressed" : "released"));
 }
 
-static void tool_nds_input_release_all(char* result, size_t result_size)
+static std::string ToolInputTouch(const mcpjson::Value &args)
 {
-	UserButtons buttons = {};
-	apply_user_buttons(buttons);
-	NDS_releaseTouch();
-	snprintf(result, result_size, "{\"content\":[{\"type\":\"text\",\"text\":\"OK: all keys released\"}]}");
+	const mcpjson::Value *xValue = args.Find("x");
+	const mcpjson::Value *yValue = args.Find("y");
+	const bool touch = args.GetBool("touch", true);
+	const int holdFrames = HoldFramesFromArgs(args);
+
+	if (!touch)
+	{
+		ApplyUserTouch(0, 0, false);
+		return TextResult("touch released");
+	}
+
+	if (xValue == NULL || yValue == NULL || xValue->IsNull() || yValue->IsNull())
+		return ErrorResult("missing x or y");
+
+	const u16 x = ClampTouchCoordinate(xValue->AsInt(), GPU_FRAMEBUFFER_NATIVE_WIDTH);
+	const u16 y = ClampTouchCoordinate(yValue->AsInt(), GPU_FRAMEBUFFER_NATIVE_HEIGHT);
+	ApplyUserTouch(x, y, true);
+
+	if (holdFrames > 0)
+	{
+		if (!IsROMLoaded())
+			return ErrorResult("no ROM loaded, cannot hold a touch for a number of frames");
+
+		RunFrames(holdFrames);
+		ApplyUserTouch(0, 0, false);
+
+		return TextResult(Format("touched (%u,%u) for %d frame(s), then released; frame=%d",
+			(unsigned)x, (unsigned)y, holdFrames, currFrameCounter));
+	}
+
+	return TextResult(Format("touching (%u,%u)", (unsigned)x, (unsigned)y));
 }
 
-static void handle_tools_call(const char* json, char* id_str, int id_num, int use_id_num)
+static std::string ToolInputReleaseAll()
 {
-	char name[64] = {0};
-	find_json_string_val(json, "name", name, sizeof(name));
-	std::string result_large;
-	char result_buf[1024];
-	const char* result_ptr = result_buf;
-
-	if (strcmp(name, "nds_screenshot") == 0) {
-		tool_nds_screenshot(json, result_large);
-		result_ptr = result_large.c_str();
-	} else if (strcmp(name, "nds_pause") == 0)
-		tool_nds_pause(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_resume") == 0)
-		tool_nds_resume(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_step") == 0)
-		tool_nds_step(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_read_memory") == 0)
-		tool_nds_read_memory(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_write_memory") == 0)
-		tool_nds_write_memory(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_get_registers") == 0)
-		tool_nds_get_registers(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_get_state") == 0)
-		tool_nds_get_state(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_load_rom") == 0)
-		tool_nds_load_rom(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_reload_rom") == 0)
-		tool_nds_reload_rom(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_reset") == 0)
-		tool_nds_reset(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_get_rom_info") == 0)
-		tool_nds_get_rom_info(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_set_breakpoint") == 0)
-		tool_nds_set_breakpoint(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_clear_breakpoint") == 0)
-		tool_nds_clear_breakpoint(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_clear_all_breakpoints") == 0)
-		tool_nds_clear_all_breakpoints(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_list_breakpoints") == 0)
-		tool_nds_list_breakpoints(result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_input_key") == 0)
-		tool_nds_input_key(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_input_touch") == 0)
-		tool_nds_input_touch(json, result_buf, sizeof(result_buf));
-	else if (strcmp(name, "nds_input_release_all") == 0)
-		tool_nds_input_release_all(result_buf, sizeof(result_buf));
-	else
-		snprintf(result_buf, sizeof(result_buf), "{\"content\":[{\"type\":\"text\",\"text\":\"unknown tool: %s\"}]}", name);
-
-	/* MCP tools/call result: { "content": [ { "type": "text", "text": "..." } ] } */
-	send_response(id_str, id_num, use_id_num, result_ptr);
+	UserButtons buttons = UserButtons();
+	memset(&buttons, 0, sizeof(buttons));
+	ApplyUserButtons(buttons);
+	ApplyUserTouch(0, 0, false);
+	return TextResult("all inputs released");
 }
 
-void mcp_server_process_line_http(const char* line_buf, char* out_buf, size_t out_size)
+//---------------------------------------------------------------------------
+// Tool catalog
+//---------------------------------------------------------------------------
+
+static const char *TOOLS_JSON = R"json({"tools":[
+{"name":"nds_get_state","description":"Report emulation state: running/paused, frame counter, both CPU program counters and the loaded ROM.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_pause","description":"Pause emulation.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_resume","description":"Resume emulation.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_step","description":"Single step one CPU by a number of instructions.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"count":{"type":"integer","description":"Instructions to step, default 1, max 1000."}}}},
+{"name":"nds_run_frames","description":"Run a fixed number of video frames and then return. The emulator is advanced synchronously, which makes scripted play deterministic.","inputSchema":{"type":"object","properties":{"frames":{"type":"integer","description":"Frames to run, default 1, max 3600."}}}},
+{"name":"nds_reset","description":"Reset the NDS console.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_quit","description":"Ask the emulator to shut down and exit.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_load_rom","description":"Load an NDS ROM from disk.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Path to the .nds file."}},"required":["path"]}},
+{"name":"nds_reload_rom","description":"Reload the ROM that was loaded last.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_get_rom_info","description":"Report the title, serial, size and entry points of the loaded ROM.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_read_memory","description":"Read memory and return it as a hex dump.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"address":{"type":"string","description":"Address, hex by default (e.g. 02000000 or 0x02000000)."},"size":{"type":"integer","description":"Bytes to read, default 16, max 4096."}},"required":["address"]}},
+{"name":"nds_write_memory","description":"Write bytes to memory.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"address":{"type":"string","description":"Address, hex by default."},"value":{"description":"Hex byte string (e.g. AABBCCDD), a number, or an array of byte values."},"size":{"type":"integer","description":"Width in bytes when value is a number: 1, 2 or 4 (default 4, little endian)."}},"required":["address","value"]}},
+{"name":"nds_search_memory","description":"Search a memory range for a byte pattern.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"value":{"description":"Hex byte string, number, or array of byte values to look for."},"size":{"type":"integer","description":"Width in bytes when value is a number: 1, 2 or 4 (default 4)."},"start":{"type":"string","description":"First address of the range, hex, default 02000000."},"end":{"type":"string","description":"End of the range (exclusive), hex, default 02400000. At most 16 MiB."},"max_results":{"type":"integer","description":"Maximum hits to report, default 32, max 256."}},"required":["value"]}},
+{"name":"nds_get_registers","description":"Read the ARM register file of one CPU.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."}}}},
+{"name":"nds_set_register","description":"Write one ARM register.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"register":{"type":"string","description":"R0-R15, PC, SP, LR or CPSR."},"value":{"type":"string","description":"New value, hex by default."}},"required":["register","value"]}},
+{"name":"nds_disassemble","description":"Disassemble instructions starting at an address.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"address":{"type":"string","description":"Start address, hex. Defaults to the current PC."},"count":{"type":"integer","description":"Instructions to disassemble, default 8, max 128."},"thumb":{"type":"boolean","description":"Force THUMB decoding. Defaults to the current CPU state."}}}},
+{"name":"nds_set_breakpoint","description":"Set an execute, read or write breakpoint. Read and write breakpoints pause emulation on every build; execute breakpoints are only enforced by the Windows frontend.","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"execute (default), read or write."},"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7, for execute breakpoints."},"address":{"type":"string","description":"Address, hex."}},"required":["address"]}},
+{"name":"nds_clear_breakpoint","description":"Clear one breakpoint.","inputSchema":{"type":"object","properties":{"type":{"type":"string","description":"execute (default), read or write."},"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7, for execute breakpoints."},"address":{"type":"string","description":"Address, hex."}},"required":["address"]}},
+{"name":"nds_clear_all_breakpoints","description":"Clear every execute, read and write breakpoint.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_list_breakpoints","description":"List every breakpoint currently set.","inputSchema":{"type":"object","properties":{}}},
+{"name":"nds_save_state","description":"Write a savestate to a file or to a numbered slot.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Destination file. Takes precedence over slot."},"slot":{"type":"integer","description":"Savestate slot, 0-9."}}}},
+{"name":"nds_load_state","description":"Restore a savestate from a file or from a numbered slot.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Source file. Takes precedence over slot."},"slot":{"type":"integer","description":"Savestate slot, 0-9."}}}},
+{"name":"nds_screenshot","description":"Capture the current display. Returns the image inline unless a path is given.","inputSchema":{"type":"object","properties":{"screen":{"type":"string","description":"both (default), main or touch."},"path":{"type":"string","description":"Write the image to this file instead of returning it inline."},"format":{"type":"string","description":"png (default) or bmp. An explicit .png/.bmp extension in path wins."}}}},
+{"name":"nds_input_key","description":"Press or release a DS button, optionally holding it for a number of frames.","inputSchema":{"type":"object","properties":{"button":{"type":"string","description":"A, B, X, Y, start, select, up, down, left, right, L, R, debug or lid."},"pressed":{"type":"boolean","description":"true to press (default), false to release."},"frames":{"type":"integer","description":"Hold for this many frames, run them, then release. Default 0 (latch)."}},"required":["button"]}},
+{"name":"nds_input_touch","description":"Touch the bottom screen, optionally holding the touch for a number of frames.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","description":"0-255."},"y":{"type":"integer","description":"0-191."},"touch":{"type":"boolean","description":"true to touch (default), false to release."},"frames":{"type":"integer","description":"Hold for this many frames, run them, then release. Default 0 (latch)."}}}},
+{"name":"nds_input_release_all","description":"Release every button and the touch screen.","inputSchema":{"type":"object","properties":{}}}
+]})json";
+
+/*
+	The catalog above is laid out one tool per line for readability, but the stdio
+	transport frames messages on newlines, so responses have to stay on one line.
+	The line breaks only ever sit between JSON tokens, never inside a string.
+*/
+static const std::string& CompactToolsJSON()
 {
-	if (!out_buf || out_size == 0) return;
-	g_http_response_buf = out_buf;
-	g_http_response_size = out_size;
-	out_buf[0] = '\0';
-	mcp_server_process_line(line_buf);
-	g_http_response_buf = NULL;
-	g_http_response_size = 0;
+	static std::string compact;
+	if (compact.empty())
+	{
+		for (const char *p = TOOLS_JSON; *p != '\0'; p++)
+		{
+			if (*p != '\n' && *p != '\r')
+				compact.push_back(*p);
+		}
+	}
+	return compact;
 }
 
-void mcp_server_process_line(const char* line_buf)
+//---------------------------------------------------------------------------
+// JSON-RPC dispatch
+//---------------------------------------------------------------------------
+
+static std::string CallTool(const std::string &name, const mcpjson::Value &args)
 {
-	char method[128] = {0};
-	char id_str[64] = {0};
-	int id_num = 0;
-	int use_id_num = 0;
-	find_json_string_val(line_buf, "method", method, sizeof(method));
-	if (strstr(line_buf, "\"id\":")) {
-		const char* idp = strstr(line_buf, "\"id\":");
-		if (idp) {
-			idp += 5;
-			while (*idp == ' ') idp++;
-			if (*idp == '"')
-				find_json_string_val(line_buf, "id", id_str, sizeof(id_str));
-			else {
-				id_num = (int)strtol(idp, NULL, 10);
-				use_id_num = 1;
+	if (name == "nds_get_state")              return ToolGetState();
+	if (name == "nds_pause")                  return ToolPause();
+	if (name == "nds_resume")                 return ToolResume();
+	if (name == "nds_step")                   return ToolStep(args);
+	if (name == "nds_run_frames")             return ToolRunFrames(args);
+	if (name == "nds_reset")                  return ToolReset();
+	if (name == "nds_quit")                   return ToolQuit();
+	if (name == "nds_load_rom")               return ToolLoadROM(args);
+	if (name == "nds_reload_rom")             return ToolReloadROM();
+	if (name == "nds_get_rom_info")           return ToolGetROMInfo();
+	if (name == "nds_read_memory")            return ToolReadMemory(args);
+	if (name == "nds_write_memory")           return ToolWriteMemory(args);
+	if (name == "nds_search_memory")          return ToolSearchMemory(args);
+	if (name == "nds_get_registers")          return ToolGetRegisters(args);
+	if (name == "nds_set_register")           return ToolSetRegister(args);
+	if (name == "nds_disassemble")            return ToolDisassemble(args);
+	if (name == "nds_set_breakpoint")         return ToolSetBreakpoint(args);
+	if (name == "nds_clear_breakpoint")       return ToolClearBreakpoint(args);
+	if (name == "nds_clear_all_breakpoints")  return ToolClearAllBreakpoints();
+	if (name == "nds_list_breakpoints")       return ToolListBreakpoints();
+	if (name == "nds_save_state")             return ToolSaveState(args);
+	if (name == "nds_load_state")             return ToolLoadState(args);
+	if (name == "nds_screenshot")             return ToolScreenshot(args);
+	if (name == "nds_input_key")              return ToolInputKey(args);
+	if (name == "nds_input_touch")            return ToolInputTouch(args);
+	if (name == "nds_input_release_all")      return ToolInputReleaseAll();
+
+	return std::string();
+}
+
+static std::string NegotiateProtocolVersion(const mcpjson::Value *params)
+{
+	if (params != NULL)
+	{
+		const std::string requested = params->GetString("protocolVersion");
+		for (size_t i = 0; i < sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]); i++)
+		{
+			if (requested == SUPPORTED_PROTOCOL_VERSIONS[i])
+				return requested;
+		}
+	}
+	return DEFAULT_PROTOCOL_VERSION;
+}
+
+/* Returns false when the message is a notification and needs no response. */
+static bool HandleMessage(const mcpjson::Value &message, std::string &outResponse)
+{
+	if (!message.IsObject())
+	{
+		outResponse = MakeError("null", -32600, "Invalid Request: expected a JSON-RPC object");
+		return true;
+	}
+
+	const mcpjson::Value *id = message.Find("id");
+	const bool isNotification = (id == NULL);
+	const std::string idLiteral = IDLiteral(id);
+
+	const mcpjson::Value *methodValue = message.Find("method");
+	if (methodValue == NULL || !methodValue->IsString())
+	{
+		if (isNotification)
+			return false;
+		outResponse = MakeError(idLiteral, -32600, "Invalid Request: missing method");
+		return true;
+	}
+
+	const std::string method = methodValue->str;
+	const mcpjson::Value *params = message.Find("params");
+
+	//notifications never get an answer
+	if (isNotification)
+	{
+		//notifications/initialized, notifications/cancelled and friends need no work here
+		return false;
+	}
+
+	if (method == "initialize")
+	{
+		std::string result("{\"protocolVersion\":");
+		result += mcpjson::Quote(NegotiateProtocolVersion(params));
+		result += ",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":";
+		result += mcpjson::Quote(SERVER_NAME);
+		result += ",\"version\":";
+		result += mcpjson::Quote(SERVER_VERSION);
+		result += "},\"instructions\":\"Debug and drive a Nintendo DS ROM running in DeSmuME. Use nds_get_state first, nds_run_frames to advance emulation deterministically, and nds_screenshot to look at the screens.\"}";
+		outResponse = MakeResult(idLiteral, result);
+		return true;
+	}
+
+	if (method == "ping")
+	{
+		outResponse = MakeResult(idLiteral, "{}");
+		return true;
+	}
+
+	if (method == "tools/list")
+	{
+		outResponse = MakeResult(idLiteral, CompactToolsJSON());
+		return true;
+	}
+
+	if (method == "resources/list")
+	{
+		outResponse = MakeResult(idLiteral, "{\"resources\":[]}");
+		return true;
+	}
+
+	if (method == "resources/templates/list")
+	{
+		outResponse = MakeResult(idLiteral, "{\"resourceTemplates\":[]}");
+		return true;
+	}
+
+	if (method == "prompts/list")
+	{
+		outResponse = MakeResult(idLiteral, "{\"prompts\":[]}");
+		return true;
+	}
+
+	if (method == "logging/setLevel")
+	{
+		outResponse = MakeResult(idLiteral, "{}");
+		return true;
+	}
+
+	if (method == "tools/call")
+	{
+		if (params == NULL || !params->IsObject())
+		{
+			outResponse = MakeError(idLiteral, -32602, "Invalid params: expected an object");
+			return true;
+		}
+
+		const std::string name = params->GetString("name");
+		if (name.empty())
+		{
+			outResponse = MakeError(idLiteral, -32602, "Invalid params: missing tool name");
+			return true;
+		}
+
+		const mcpjson::Value *arguments = params->Find("arguments");
+		const mcpjson::Value emptyArguments;
+		const mcpjson::Value &args = (arguments != NULL && arguments->IsObject()) ? *arguments : emptyArguments;
+
+		const std::string result = CallTool(name, args);
+		if (result.empty())
+		{
+			outResponse = MakeError(idLiteral, -32602, "Unknown tool: " + name);
+			return true;
+		}
+
+		outResponse = MakeResult(idLiteral, result);
+		return true;
+	}
+
+	outResponse = MakeError(idLiteral, -32601, "Method not found: " + method);
+	return true;
+}
+
+/* Returns false when nothing should be sent back. */
+static bool ProcessRequest(const char *request, std::string &outResponse)
+{
+	if (request == NULL || request[0] == '\0')
+		return false;
+
+	mcpjson::Value message;
+	if (!mcpjson::Parse(request, strlen(request), message))
+	{
+		outResponse = MakeError("null", -32700, "Parse error");
+		return true;
+	}
+
+	//JSON-RPC batch
+	if (message.IsArray())
+	{
+		if (message.items.empty())
+		{
+			outResponse = MakeError("null", -32600, "Invalid Request: empty batch");
+			return true;
+		}
+
+		std::string batch("[");
+		bool any = false;
+		for (size_t i = 0; i < message.items.size(); i++)
+		{
+			std::string single;
+			if (!HandleMessage(message.items[i], single))
+				continue;
+			if (any)
+				batch += ",";
+			batch += single;
+			any = true;
+		}
+		batch += "]";
+
+		if (!any)
+			return false;
+
+		outResponse.swap(batch);
+		return true;
+	}
+
+	return HandleMessage(message, outResponse);
+}
+
+static char* DuplicateString(const std::string &text)
+{
+	char *copy = (char *)malloc(text.size() + 1);
+	if (copy == NULL)
+		return NULL;
+	memcpy(copy, text.c_str(), text.size() + 1);
+	return copy;
+}
+
+//---------------------------------------------------------------------------
+// Cross thread request queue
+//---------------------------------------------------------------------------
+
+namespace
+{
+
+struct PendingRequest
+{
+	PendingRequest(const char *text) : request(text != NULL ? text : ""), hasResponse(false), done(false) {}
+
+	std::string request;
+	std::string response;
+	bool hasResponse;
+	bool done;
+};
+
+typedef std::shared_ptr<PendingRequest> PendingRequestPtr;
+
+} //anonymous namespace
+
+static std::mutex g_queueMutex;
+static std::condition_variable g_queueSignal;
+static std::condition_variable g_doneSignal;
+static std::deque<PendingRequestPtr> g_queue;
+static bool g_shuttingDown = false;
+
+char* mcp_server_process_alloc(const char *request)
+{
+	std::string response;
+	if (!ProcessRequest(request, response))
+		return NULL;
+	return DuplicateString(response);
+}
+
+char* mcp_server_dispatch(const char *request, int timeout_ms)
+{
+	PendingRequestPtr pending(new PendingRequest(request));
+
+	{
+		std::lock_guard<std::mutex> lock(g_queueMutex);
+		if (g_shuttingDown)
+			return DuplicateString(MakeError("null", -32000, "Emulator is shutting down"));
+		g_queue.push_back(pending);
+	}
+	g_queueSignal.notify_one();
+
+	{
+		std::unique_lock<std::mutex> lock(g_queueMutex);
+		if (timeout_ms > 0)
+		{
+			g_doneSignal.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&pending]{ return pending->done; });
+		}
+		else
+		{
+			g_doneSignal.wait(lock, [&pending]{ return pending->done; });
+		}
+
+		if (!pending->done)
+		{
+			//the emulation thread never picked it up; drop it from the queue
+			for (std::deque<PendingRequestPtr>::iterator it = g_queue.begin(); it != g_queue.end(); ++it)
+			{
+				if (*it == pending)
+				{
+					g_queue.erase(it);
+					break;
+				}
 			}
+			return DuplicateString(MakeError("null", -32001, "Timed out waiting for the emulation thread"));
+		}
+
+		if (!pending->hasResponse)
+			return NULL;
+
+		return DuplicateString(pending->response);
+	}
+}
+
+int mcp_server_poll(int timeout_ms)
+{
+	std::unique_lock<std::mutex> lock(g_queueMutex);
+
+	if (g_queue.empty() && timeout_ms > 0)
+		g_queueSignal.wait_for(lock, std::chrono::milliseconds(timeout_ms), []{ return !g_queue.empty() || g_shuttingDown; });
+
+	int handled = 0;
+	while (!g_queue.empty())
+	{
+		PendingRequestPtr pending = g_queue.front();
+		g_queue.pop_front();
+
+		lock.unlock();
+		std::string response;
+		const bool hasResponse = ProcessRequest(pending->request.c_str(), response);
+		lock.lock();
+
+		pending->response.swap(response);
+		pending->hasResponse = hasResponse;
+		pending->done = true;
+		handled++;
+	}
+
+	lock.unlock();
+	if (handled > 0)
+		g_doneSignal.notify_all();
+
+	return handled;
+}
+
+int mcp_server_quit_requested(void)
+{
+	return g_quitRequested ? 1 : 0;
+}
+
+//---------------------------------------------------------------------------
+// Transports
+//---------------------------------------------------------------------------
+
+/* Tools such as nds_run_frames can legitimately keep the emulation thread busy. */
+static const int DISPATCH_TIMEOUT_MS = 120000;
+
+static std::thread g_stdioThread;
+static std::atomic<bool> g_stdioRunning(false);
+static bool g_httpRunning = false;
+static FILE *g_protocolOut = NULL;
+
+static char* HTTPProcess(const char *body)
+{
+	return mcp_server_dispatch(body, DISPATCH_TIMEOUT_MS);
+}
+
+int mcp_server_start_http(int port)
+{
+	if (g_httpRunning)
+		return 0;
+
+	if (mcp_http_start(port, HTTPProcess) != 0)
+		return -1;
+
+	g_httpRunning = true;
+	return 0;
+}
+
+void mcp_server_stop_http(void)
+{
+	if (!g_httpRunning)
+		return;
+	mcp_http_stop();
+	g_httpRunning = false;
+}
+
+/*
+	stdout belongs to the protocol once the stdio transport is in use. Anything the
+	emulator prints would corrupt the stream, so hand the real stdout to the
+	transport and point the process' stdout at stderr. Frontends should call this
+	before any other subsystem gets a chance to print.
+*/
+void mcp_server_capture_stdout(void)
+{
+	if (g_protocolOut != NULL)
+		return;
+
+	fflush(stdout);
+	const int duplicated = MCP_DUP(MCP_FILENO(stdout));
+	if (duplicated >= 0)
+	{
+		MCP_DUP2(MCP_FILENO(stderr), MCP_FILENO(stdout));
+		g_protocolOut = MCP_FDOPEN(duplicated, "w");
+	}
+	if (g_protocolOut == NULL)
+		g_protocolOut = stdout;
+}
+
+static void StdioThreadProc()
+{
+	std::string line;
+
+	while (g_stdioRunning.load())
+	{
+		const int c = fgetc(stdin);
+		if (c == EOF)
+			break;
+
+		if (c != '\n' && c != '\r')
+		{
+			line.push_back((char)c);
+			continue;
+		}
+
+		if (line.empty())
+			continue;
+
+		char *response = mcp_server_dispatch(line.c_str(), DISPATCH_TIMEOUT_MS);
+		line.clear();
+
+		if (response == NULL)
+			continue;
+
+		FILE *out = (g_protocolOut != NULL) ? g_protocolOut : stdout;
+		fwrite(response, 1, strlen(response), out);
+		fputc('\n', out);
+		fflush(out);
+		free(response);
+	}
+}
+
+int mcp_server_start_stdio(void)
+{
+	if (g_stdioRunning.load())
+		return 0;
+
+	mcp_server_capture_stdout();
+
+	g_stdioRunning.store(true);
+	g_stdioThread = std::thread(StdioThreadProc);
+	return 0;
+}
+
+void mcp_server_stop_stdio(void)
+{
+	if (!g_stdioRunning.load())
+		return;
+
+	g_stdioRunning.store(false);
+
+	/*
+		The reader is parked inside a blocking read on stdin and there is no portable
+		way to interrupt that, so let it go and rely on process teardown.
+	*/
+	if (g_stdioThread.joinable())
+		g_stdioThread.detach();
+}
+
+//---------------------------------------------------------------------------
+// Lifetime
+//---------------------------------------------------------------------------
+
+void mcp_server_init(mcp_set_execute_fn set_execute, mcp_get_execute_fn get_execute)
+{
+	g_setExecute = set_execute;
+	g_getExecute = get_execute;
+	g_quitRequested = false;
+
+	std::lock_guard<std::mutex> lock(g_queueMutex);
+	g_shuttingDown = false;
+}
+
+void mcp_server_deinit(void)
+{
+	/*
+		Close the queue before stopping the transports: a transport thread parked in
+		mcp_server_dispatch() is waiting for this very thread, so joining it first
+		would deadlock until the dispatch timeout expired.
+	*/
+	{
+		std::lock_guard<std::mutex> lock(g_queueMutex);
+		g_shuttingDown = true;
+
+		//unblock anything still waiting on the emulation thread
+		while (!g_queue.empty())
+		{
+			PendingRequestPtr pending = g_queue.front();
+			g_queue.pop_front();
+			pending->response = MakeError("null", -32000, "Emulator is shutting down");
+			pending->hasResponse = true;
+			pending->done = true;
 		}
 	}
 
-	if (strcmp(method, "initialize") == 0)
-		handle_initialize(line_buf, id_str, id_num, use_id_num);
-	else if (strcmp(method, "tools/list") == 0)
-		handle_tools_list(line_buf, id_str, id_num, use_id_num);
-	else if (strcmp(method, "tools/call") == 0)
-		handle_tools_call(line_buf, id_str, id_num, use_id_num);
-	else
-		send_error(id_str, id_num, use_id_num, -32601, "Method not found");
-}
+	g_queueSignal.notify_all();
+	g_doneSignal.notify_all();
 
-void mcp_server_flush(void)
-{
-	fflush(stdout);
+	mcp_server_stop_http();
+	mcp_server_stop_stdio();
+
+	g_setExecute = NULL;
+	g_getExecute = NULL;
 }

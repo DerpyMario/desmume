@@ -49,8 +49,9 @@
 #include "../utils/xstring.h"
 #ifdef HAVE_MCP
 #include "../mcp/mcp_server.h"
-#include <sys/select.h>
 #endif
+#include <signal.h>
+#include <time.h>
 
 #ifdef GDB_STUB
 #include "../armcpu.h"
@@ -223,8 +224,14 @@ fill_config( class configured_features *config,
   }
 
   if (config->nds_file == "") {
-    g_printerr("Need to specify file to load.\n");
-    goto error;
+#ifdef HAVE_MCP
+    /* an MCP client can load a ROM at any time with nds_load_rom */
+    if (!config->enable_mcp)
+#endif
+    {
+      g_printerr("Need to specify file to load.\n");
+      goto error;
+    }
   }
 
 #ifdef GDB_STUB
@@ -349,6 +356,181 @@ static gdbstub_handle_t setup_gdb_stub(u16 port, armcpu_t *cpu, const armcpu_mem
 }
 #endif
 
+/*
+ * Headless operation: emulate without opening a window, which is what an MCP
+ * client wants and what makes the CLI usable on a machine with no display.
+ */
+static volatile sig_atomic_t headless_interrupted = 0;
+
+static void headless_signal_handler(int signum) {
+  (void)signum;
+  headless_interrupted = 1;
+}
+
+static bool headless_mode(class configured_features *config) {
+#ifdef HAVE_MCP
+  if (config->enable_mcp)
+    return true;
+#endif
+  return config->headless != 0;
+}
+
+static u64 monotonic_microseconds(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (u64)now.tv_sec * 1000000ULL + (u64)now.tv_nsec / 1000ULL;
+}
+
+static void sleep_microseconds(u64 microseconds) {
+  struct timespec request;
+  request.tv_sec = (time_t)(microseconds / 1000000ULL);
+  request.tv_nsec = (long)((microseconds % 1000000ULL) * 1000ULL);
+  nanosleep(&request, NULL);
+}
+
+#ifdef HAVE_MCP
+static void mcp_set_execute(int run) {
+  execute = (run != 0);
+}
+
+static int mcp_get_execute(void) {
+  return execute ? 1 : 0;
+}
+
+static int start_mcp_server(class configured_features *config) {
+  mcp_server_init(mcp_set_execute, mcp_get_execute);
+
+  if (config->mcp_port > 0) {
+    if (mcp_server_start_http(config->mcp_port) != 0) {
+      fprintf(stderr, "Failed to start the MCP server on 127.0.0.1:%d\n", config->mcp_port);
+      return -1;
+    }
+    fprintf(stderr, "DeSmuME MCP server listening on http://127.0.0.1:%d/mcp (JSON-RPC over HTTP POST)\n",
+            config->mcp_port);
+  } else {
+    if (mcp_server_start_stdio() != 0) {
+      fprintf(stderr, "Failed to start the MCP stdio transport\n");
+      return -1;
+    }
+    fprintf(stderr, "DeSmuME MCP server on stdio (newline delimited JSON-RPC)\n");
+  }
+
+  if (!config->nds_file.empty())
+    fprintf(stderr, "  ROM: %s\n", config->nds_file.c_str());
+  fflush(stderr);
+
+  return 0;
+}
+#endif
+
+/*
+ * With the stdio transport the protocol owns stdout, so it has to be claimed
+ * before any subsystem prints a banner there. That happens before the command
+ * line is parsed, hence this small scan of argv.
+ */
+#ifdef HAVE_MCP
+static bool mcp_stdio_requested(int argc, char **argv) {
+  bool stdio = false;
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--mcp-port") == 0 || strncmp(argv[i], "--mcp-port=", 11) == 0)
+      return false;
+    if (strcmp(argv[i], "--mcp") == 0)
+      stdio = true;
+  }
+
+  return stdio;
+}
+#endif
+
+static int run_headless(class configured_features *config) {
+  bool mcp_enabled = false;
+#ifdef HAVE_MCP
+  mcp_enabled = (config->enable_mcp != 0);
+#endif
+
+  if (!config->nds_file.empty()) {
+    if (NDS_LoadROM( config->nds_file.c_str()) < 0) {
+      fprintf(stderr, "error while loading %s\n", config->nds_file.c_str());
+      return 1;
+    }
+    if (config->load_slot != -1)
+      loadstate_slot(config->load_slot);
+  } else if (!mcp_enabled) {
+    /* only an MCP client can load a ROM later on */
+    fprintf(stderr, "no ROM to run\n");
+    return 1;
+  }
+
+  execute = (config->start_paused == 0);
+
+  signal(SIGINT, headless_signal_handler);
+  signal(SIGTERM, headless_signal_handler);
+
+#ifdef HAVE_MCP
+  if (mcp_enabled && start_mcp_server(config) != 0)
+    return 1;
+#endif
+
+  const u64 frame_microseconds = 1000000ULL / 60;
+  u64 next_frame = monotonic_microseconds();
+
+  while (!headless_interrupted) {
+#ifdef HAVE_MCP
+    if (mcp_enabled && mcp_server_quit_requested())
+      break;
+#endif
+
+    const bool running = execute && (gameInfo.reader != NULL);
+
+    if (running) {
+      NDS_exec<false>();
+      SPU_Emulate_user();
+
+      for (int i = 0; i < config->frameskip; i++) {
+        NDS_SkipNextFrame();
+        NDS_exec<false>();
+        SPU_Emulate_user();
+      }
+    }
+
+    bool idled = false;
+#ifdef HAVE_MCP
+    if (mcp_enabled) {
+      /* when paused this doubles as the idle wait, so requests are still answered */
+      mcp_server_poll(running ? 0 : 50);
+      idled = !running;
+    }
+#endif
+    if (!running && !idled)
+      sleep_microseconds(50000);
+
+    if (running && !config->disable_limiter) {
+      const u64 now = monotonic_microseconds();
+      next_frame += frame_microseconds * (u64)(1 + config->frameskip);
+      if (next_frame > now) {
+        const u64 delay = next_frame - now;
+        if (delay > 500000ULL)
+          next_frame = now;  /* the clock jumped, resynchronise */
+        else
+          sleep_microseconds(delay);
+      } else if (now - next_frame > 500000ULL) {
+        /* we fell too far behind: do not try to catch up at full speed */
+        next_frame = now;
+      }
+    } else if (running) {
+      next_frame = monotonic_microseconds();
+    }
+  }
+
+#ifdef HAVE_MCP
+  if (mcp_enabled)
+    mcp_server_deinit();
+#endif
+
+  return 0;
+}
+
 int main(int argc, char ** argv) {
   class configured_features my_config;
   struct ctrls_event_config ctrls_cfg;
@@ -366,6 +548,11 @@ int main(int argc, char ** argv) {
   u32 fps_timing = 0;
   u32 fps_frame_counter = 0;
   u32 fps_previous_time = 0;
+#endif
+
+#ifdef HAVE_MCP
+  if (mcp_stdio_requested(argc, argv))
+    mcp_server_capture_stdout();
 #endif
 
   NDS_Init();
@@ -472,7 +659,7 @@ int main(int argc, char ** argv) {
   }
 #endif
 
-  if ( !my_config.disable_sound) {
+  if ( !my_config.disable_sound && !headless_mode( &my_config)) {
     SPU_ChangeSoundCore(SNDCORE_SDL, 735 * 4);
   }
 
@@ -483,57 +670,8 @@ int main(int argc, char ** argv) {
 
   backup_setManualBackupType(my_config.savetype);
 
-#ifdef HAVE_MCP
-  if (my_config.enable_mcp) {
-    /* MCP mode: headless, stdio JSON-RPC. ROM optional (can load via nds_load_rom tool). */
-    if (!my_config.nds_file.empty()) {
-      error = NDS_LoadROM(my_config.nds_file.c_str());
-      if (error < 0) {
-        fprintf(stderr, "error while loading %s\n", my_config.nds_file.c_str());
-        exit(-1);
-      }
-    }
-    execute = my_config.start_paused ? false : true;
-
-    static void set_execute_cb(int run) { execute = (run != 0); }
-    static int get_execute_cb(void) { return execute ? 1 : 0; }
-    mcp_server_init(set_execute_cb, get_execute_cb);
-
-    static char mcp_line_buf[65536];
-    static size_t mcp_line_len = 0;
-
-    for (;;) {
-      fd_set rfd;
-      struct timeval tv;
-      FD_ZERO(&rfd);
-      FD_SET(0, &rfd);
-      if (execute) {
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-      } else {
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000;
-      }
-      int r = select(1, &rfd, NULL, NULL, &tv);
-      if (r > 0 && FD_ISSET(0, &rfd)) {
-        int c = getchar();
-        if (c == EOF) break;
-        if (c == '\n' || c == '\r') {
-          if (mcp_line_len > 0) {
-            mcp_line_buf[mcp_line_len] = '\0';
-            mcp_line_len = 0;
-            mcp_server_process_line(mcp_line_buf);
-            mcp_server_flush();
-          }
-        } else if (mcp_line_len < sizeof(mcp_line_buf) - 1) {
-          mcp_line_buf[mcp_line_len++] = (char)c;
-        }
-      }
-      if (execute && gameInfo.reader) {
-        NDS_exec<false>();
-        SPU_Emulate_user();
-      }
-    }
+  if (headless_mode(&my_config)) {
+    const int status = run_headless(&my_config);
 
     delete driver;
     driver = NULL;
@@ -543,9 +681,8 @@ int main(int argc, char ** argv) {
     gdbstub_mutex_destroy();
 #endif
     NDS_DeInit();
-    return 0;
+    return status;
   }
-#endif
 
   error = NDS_LoadROM( my_config.nds_file.c_str() );
   if (error < 0) {

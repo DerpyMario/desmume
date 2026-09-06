@@ -132,7 +132,12 @@ ENDL
 " --arm7gdb PORTNUM          Enable the ARM7 GDB stub on the given port" ENDL
 ENDL
 #endif
-" --mcp                       Run as MCP server over stdio for NDS ROM debugging" ENDL
+" --mcp                      Expose the emulator to an MCP client over stdio" ENDL
+" --mcp-port PORTNUM         Serve MCP over HTTP on 127.0.0.1:PORTNUM instead" ENDL
+"                            of stdio (implies --mcp)" ENDL
+" --headless                 Run emulation without opening a window" ENDL
+"                            (implied by --mcp)" ENDL
+ENDL
 "Utility commands which occur in place of emulation:" ENDL
 " --advanscene-import PATH   Import advanscene, dump .ddb, and exit" ENDL
 ENDL
@@ -176,6 +181,8 @@ ENDL
 #define OPT_ARM9GDB 700
 #define OPT_ARM7GDB 701
 #define OPT_MCP 702
+#define OPT_MCP_PORT 703
+#define OPT_HEADLESS 704
 
 #define OPT_RTC_DAY 800
 #define OPT_RTC_HOUR 801
@@ -230,6 +237,8 @@ CommandLine::CommandLine()
 	arm7_gdb_port             = 0;
 	start_paused              = 0;
 	enable_mcp                = 0;
+	mcp_port                  = 0;
+	headless                  = 0;
 	cflash_image              = "";
 	cflash_path               = "";
 	gbaslot_rom               = "";
@@ -337,6 +346,8 @@ bool CommandLine::parse(int argc,char **argv)
 				{ "arm7gdb", required_argument, NULL, OPT_ARM7GDB},
 			#endif
 			{ "mcp", no_argument, NULL, OPT_MCP},
+			{ "mcp-port", required_argument, NULL, OPT_MCP_PORT},
+			{ "headless", no_argument, NULL, OPT_HEADLESS},
 
 			//utilities
 			{ "advanscene-import", required_argument, NULL, OPT_ADVANSCENE},
@@ -402,6 +413,8 @@ bool CommandLine::parse(int argc,char **argv)
 		case OPT_ARM9GDB: arm9_gdb_port = atoi(optarg); break;
 		case OPT_ARM7GDB: arm7_gdb_port = atoi(optarg); break;
 		case OPT_MCP: enable_mcp = 1; break;
+		case OPT_MCP_PORT: enable_mcp = 1; mcp_port = atoi(optarg); break;
+		case OPT_HEADLESS: headless = 1; break;
 
 		//utilities
 		case OPT_ADVANSCENE: CommonSettings.run_advanscene_import = optarg; break;
@@ -509,6 +522,11 @@ bool CommandLine::validate()
 
 	if (_spu_sync_method < -1 || _spu_sync_method > 2) {
 		printerror("Invalid parameter\n");
+		return false;
+	}
+
+	if (mcp_port != 0 && (mcp_port < 1 || mcp_port > 65535)) {
+		printerror("MCP port must be in the range 1 to 65535.\n");
 		return false;
 	}
 

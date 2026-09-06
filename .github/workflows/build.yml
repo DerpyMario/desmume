@@ -1,8 +1,7 @@
 name: DeSmuME
 
 on:
-  - push
-  - pull_request
+  workflow_dispatch:
 
 jobs:
   build:

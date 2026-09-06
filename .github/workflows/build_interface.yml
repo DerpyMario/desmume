@@ -1,8 +1,7 @@
 name: DeSmuME Interface (DLL/SO)
 
 on:
-  - push
-  - pull_request
+  workflow_dispatch:
 
 jobs:
   build_linux:

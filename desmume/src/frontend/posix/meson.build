@@ -310,6 +310,15 @@ if get_option('gdb-stub')
   ]
 endif
 
+if get_option('mcp')
+  add_global_arguments('-DHAVE_MCP', language: ['c', 'cpp'])
+  libdesmume_src += [
+    '../../mcp/mcp_json.cpp',
+    '../../mcp/mcp_server.cpp',
+    '../../mcp/mcp_http.cpp',
+  ]
+endif
+
 libdesmume = static_library('desmume',
   libdesmume_src,
   dependencies: dependencies,
