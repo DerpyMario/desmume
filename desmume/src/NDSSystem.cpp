@@ -1968,6 +1968,93 @@ static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
 		return arm7;
 }
 
+bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress)
+{
+	const u32 pc = cpu.instruct_adr;
+	const int procnum = (int)cpu.proc_ID;
+
+	if (cpu.CPSR.bits.T)
+	{
+		const u16 opcode = _MMU_read16(procnum, MMU_AT_DEBUG, pc);
+
+		//BL and BLX immediate are a pair of halfwords, this is the first of them
+		if ((opcode & 0xF800) == 0xF000) { outReturnAddress = pc + 4; return true; }
+		//BLX register (BX, which is not a call, has bit 7 clear)
+		if ((opcode & 0xFF87) == 0x4780) { outReturnAddress = pc + 2; return true; }
+		//SWI
+		if ((opcode & 0xFF00) == 0xDF00) { outReturnAddress = pc + 2; return true; }
+
+		return false;
+	}
+
+	const u32 opcode = _MMU_read32(procnum, MMU_AT_DEBUG, pc);
+
+	//BLX immediate lives in the unconditional encoding space, so check it first
+	if ((opcode & 0xFE000000) == 0xFA000000) { outReturnAddress = pc + 4; return true; }
+	//BL
+	if ((opcode & 0x0F000000) == 0x0B000000) { outReturnAddress = pc + 4; return true; }
+	//BLX register
+	if ((opcode & 0x0FFFFFF0) == 0x012FFF30) { outReturnAddress = pc + 4; return true; }
+	//SWI
+	if ((opcode & 0x0F000000) == 0x0F000000) { outReturnAddress = pc + 4; return true; }
+
+	return false;
+}
+
+void NDS_debug_armStepOver(armcpu_t &cpu, u32 address)
+{
+	cpu.stepOverBreak = address;
+	cpu.stepSP = cpu.R[13];
+	cpu.stepMode = cpu.CPSR.bits.mode;
+	cpu.steppingOut = false;
+}
+
+void NDS_debug_armStepOut(armcpu_t &cpu)
+{
+	cpu.stepOverBreak = 0;
+	cpu.stepSP = cpu.R[13];
+	cpu.stepMode = cpu.CPSR.bits.mode;
+	cpu.steppingOut = true;
+}
+
+bool NDS_debug_isStepping(const armcpu_t &cpu)
+{
+	return (cpu.stepOverBreak != 0) || cpu.steppingOut;
+}
+
+void NDS_debug_cancelStepping(armcpu_t &cpu)
+{
+	cpu.stepOverBreak = 0;
+	cpu.stepSP = 0;
+	cpu.steppingOut = false;
+}
+
+/*
+	Ends a step over once execution is back at the address after the call, and a step
+	out once the stack frame it was armed in has been released. Both also require the
+	CPU to be in the mode they were armed in, so that an interrupt, which runs on its
+	own banked stack, cannot be mistaken for the function returning.
+*/
+static FORCEINLINE void CheckStepStop(armcpu_t &cpu)
+{
+	if (cpu.CPSR.bits.mode != cpu.stepMode)
+		return;
+
+	if (cpu.stepOverBreak != 0 && cpu.stepOverBreak == cpu.instruct_adr && cpu.R[13] >= cpu.stepSP)
+	{
+		//a recursive call reaches the same address with a deeper stack, hence the check
+		NDS_debug_cancelStepping(cpu);
+		execute = false;
+		return;
+	}
+
+	if (cpu.steppingOut && cpu.R[13] > cpu.stepSP)
+	{
+		NDS_debug_cancelStepping(cpu);
+		execute = false;
+	}
+}
+
 /*
 	Stops emulation when a CPU is about to execute an address with a breakpoint on it.
 
@@ -2066,17 +2153,7 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				//PostMessageA(DisViewWnd[0], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM9.instruct_adr);
 				//InvalidateRect(DisViewWnd[0], NULL, FALSE);
 			}
-			if (NDS_ARM9.stepOverBreak == NDS_ARM9.instruct_adr && NDS_ARM9.stepOverBreak != 0) {
-				NDS_ARM9.stepOverBreak = 0;
-				execute = false;
-				//PostMessageA(DisViewWnd[0], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM9.instruct_adr);
-				//InvalidateRect(DisViewWnd[0], NULL, FALSE);
-			}
-			// aaand handle step to return
-			if (NDS_ARM9.runToRetTmp != 0 && NDS_ARM9.runToRetTmp == NDS_ARM9.instruct_adr) {
-				NDS_ARM9.runToRetTmp = 0;
-				NDS_ARM9.runToRet = true;
-			}
+			CheckStepStop(NDS_ARM9);
 		}
 		if(doarm7 && (!doarm9 || arm7 <= timer))
 		{
@@ -2114,17 +2191,7 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				//PostMessageA(DisViewWnd[1], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM7.instruct_adr);
 				//InvalidateRect(DisViewWnd[1], NULL, FALSE);
 			}
-			if (NDS_ARM7.stepOverBreak == NDS_ARM7.instruct_adr && NDS_ARM7.stepOverBreak != 0) {
-				NDS_ARM7.stepOverBreak = 0;
-				execute = false;
-				//PostMessageA(DisViewWnd[1], WM_COMMAND, IDC_DISASMSEEK, NDS_ARM7.instruct_adr);
-				//InvalidateRect(DisViewWnd[1], NULL, FALSE);
-			}
-			// aaand handle step to return
-			if (NDS_ARM7.runToRetTmp != 0 && NDS_ARM7.runToRetTmp == NDS_ARM7.instruct_adr) {
-				NDS_ARM7.runToRetTmp = 0;
-				NDS_ARM7.runToRet = true;
-			}
+			CheckStepStop(NDS_ARM7);
 		}
 
 		timer = minarmtime<doarm9,doarm7>(arm9,arm7);

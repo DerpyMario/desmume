@@ -65,6 +65,8 @@ stream, `DELETE` with `204`, and CORS preflights are answered.
 | `nds_get_state` | Running/paused, frame counter, both PCs, loaded ROM |
 | `nds_pause` / `nds_resume` | Stop and start emulation |
 | `nds_step` | Single step instructions (`count`) |
+| `nds_step_over` | Step one instruction, running a call or SWI to completion instead of into it |
+| `nds_step_out` | Run until the current function returns to its caller |
 | `nds_run_frames` | Run exactly N frames and return, which makes scripted play deterministic |
 | `nds_reset` | Reset the console |
 | `nds_quit` | Shut the emulator down |
@@ -88,6 +90,15 @@ loop yields one iteration per resume.
 
 Reads and writes the debugger itself performs (`nds_read_memory`, `nds_write_memory`,
 `nds_search_memory`) never trip read or write breakpoints, only the emulated CPUs do.
+
+`nds_step_over` looks at the instruction at the program counter: `BL`, `BLX`, and
+`SWI` (in ARM and in THUMB) are run to completion and execution stops on the
+instruction after them; anything else is an ordinary single step. `nds_step_out` runs
+until the stack frame the CPU is in has been released. Both ignore calls made from
+within the code they are running through, so recursion and nested calls do not end
+them early, and both stop on a breakpoint if one is hit first and say so. Neither can
+run forever: `max_frames` (120 by default) bounds the wait, and they report it when
+they give up.
 
 A typical scripted interaction presses a button for a few frames and then looks at the
 result:

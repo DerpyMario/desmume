@@ -582,12 +582,16 @@ BOOL CALLBACK ViewDisasm_ARM7Proc (HWND hwnd, UINT message, WPARAM wParam, LPARA
 							return 1;
 						}
 						case IDC_RUNRET: {
-							NDS_ARM7.runToRet = true;
+							NDS_debug_armStepOut(NDS_ARM7);
 							execute = true;
 							return 1;
 						}
 						case IDC_STEPOVER: {
-							NDS_ARM7.stepOverBreak = NDS_ARM7.instruct_adr + 4;
+							u32 returnAddress = 0;
+							if (NDS_debug_getStepOverTarget(NDS_ARM7, returnAddress))
+								NDS_debug_armStepOver(NDS_ARM7, returnAddress);
+							else
+								NDS_ARM7.debugStep = true;  //not a call, so an ordinary single step
 							execute = true;
 							paused = false;
 						}
@@ -915,12 +919,16 @@ BOOL CALLBACK ViewDisasm_ARM9Proc (HWND hwnd, UINT message, WPARAM wParam, LPARA
 							return 1;
 						}
 						case IDC_RUNRET: {
-							NDS_ARM9.runToRet = true;
+							NDS_debug_armStepOut(NDS_ARM9);
 							execute = true;
 							return 1;
 						}
 						case IDC_STEPOVER: {
-							NDS_ARM9.stepOverBreak = NDS_ARM9.instruct_adr + 4;
+							u32 returnAddress = 0;
+							if (NDS_debug_getStepOverTarget(NDS_ARM9, returnAddress))
+								NDS_debug_armStepOver(NDS_ARM9, returnAddress);
+							else
+								NDS_ARM9.debugStep = true;  //not a call, so an ordinary single step
 							execute = true;
 							paused = false;
 						}
