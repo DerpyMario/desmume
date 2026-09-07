@@ -411,6 +411,25 @@ extern NDSBreakpointHit nds_breakpointHit;
 void NDS_ReportBreakpointHit(NDSBreakpointType type, u32 procnum, u32 address);
 void NDS_ClearBreakpointHit();
 
+//Stepping helpers used to implement step over and step out.
+struct armcpu_t;
+
+//True when the instruction at the CPU's current program counter is a call or a
+//software interrupt, that is, something a step over should run through rather than
+//into. outReturnAddress is where execution comes back to.
+bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress);
+
+//Stop once execution reaches address in the frame it is in now. Cleared when it fires.
+void NDS_debug_armStepOver(armcpu_t &cpu, u32 address);
+
+//Stop once the stack frame the CPU is in now has been released, which is where the
+//function it is executing returns to its caller. Cleared when it fires.
+void NDS_debug_armStepOut(armcpu_t &cpu);
+
+//Whether a step over or step out is still waiting to happen.
+bool NDS_debug_isStepping(const armcpu_t &cpu);
+void NDS_debug_cancelStepping(armcpu_t &cpu);
+
 
 struct UserButtons : buttonstruct<bool>
 {

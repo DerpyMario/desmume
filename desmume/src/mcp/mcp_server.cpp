@@ -460,20 +460,9 @@ static std::string ToolResume()
 	return TextResult("running");
 }
 
-static std::string ToolStep(const mcpjson::Value &args)
+/* Shared by nds_step and by nds_step_over when it has nothing to step over. */
+static long StepInstructions(armcpu_t &cpu, long count)
 {
-	if (!IsROMLoaded())
-		return ErrorResult("no ROM loaded");
-
-	long count = args.GetInt("count", 1);
-	if (count < 1) count = 1;
-	if (count > 1000) count = 1000;
-
-	armcpu_t &cpu = CPUFromArgs(args);
-	const int proc = ProcessorFromArgs(args);
-
-	NDS_ClearBreakpointHit();
-
 	//a paused emulator has its CPUs stalled, which would keep them from executing
 	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
 	if (wasStalled)
@@ -511,6 +500,64 @@ static std::string ToolStep(const mcpjson::Value &args)
 		NDS_debug_break();
 	SetExecute(false);
 
+	return stepped;
+}
+
+/*
+	Runs until an armed step over or step out fires, a breakpoint stops us, or the
+	frame budget runs out. Returns the number of frames that ran.
+*/
+static int RunUntilStepCompletes(armcpu_t &cpu, int maxFrames)
+{
+	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
+	if (wasStalled)
+		NDS_debug_continue();
+	ArmBreakpointSkip();
+	SetExecute(true);
+
+	int ran = 0;
+	for (int i = 0; i < maxFrames; i++)
+	{
+		NDS_exec<false>();
+		SPU_Emulate_user();
+		ran++;
+
+		if (!execute)
+			break;  //the step finished, or a breakpoint stopped us
+	}
+
+	NDS_debug_cancelStepping(cpu);
+	if (wasStalled)
+		NDS_debug_break();
+	SetExecute(false);
+
+	return ran;
+}
+
+static int StepFrameBudget(const mcpjson::Value &args)
+{
+	long frames = args.GetInt("max_frames", 120);
+	if (frames < 1) frames = 1;
+	if (frames > MAX_RUN_FRAMES) frames = MAX_RUN_FRAMES;
+	return (int)frames;
+}
+
+static std::string ToolStep(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	long count = args.GetInt("count", 1);
+	if (count < 1) count = 1;
+	if (count > 1000) count = 1000;
+
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+
+	NDS_ClearBreakpointHit();
+
+	const long stepped = StepInstructions(cpu, count);
+
 	std::string text = Format("stepped %ld instruction(s) on ARM%d; ARM9 PC=0x%08X ARM7 PC=0x%08X",
 		stepped, (proc != 0) ? 7 : 9, (unsigned)NDS_ARM9.instruct_adr, (unsigned)NDS_ARM7.instruct_adr);
 
@@ -521,6 +568,88 @@ static std::string ToolStep(const mcpjson::Value &args)
 		text += " (stopped early: the CPU is halted)";
 
 	return TextResult(text);
+}
+
+static std::string ToolStepOver(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+	const u32 from = cpu.instruct_adr;
+
+	NDS_ClearBreakpointHit();
+
+	u32 returnAddress = 0;
+	if (!NDS_debug_getStepOverTarget(cpu, returnAddress))
+	{
+		//nothing to step over, so this is an ordinary single step
+		const long stepped = StepInstructions(cpu, 1);
+
+		std::string text = Format("no call at 0x%08X, stepped %ld instruction(s) on ARM%d; PC=0x%08X",
+			(unsigned)from, stepped, (proc != 0) ? 7 : 9, (unsigned)cpu.instruct_adr);
+
+		const std::string breakpoint = BreakpointHitDescription();
+		if (!breakpoint.empty())
+			text += Format(" (stopped on %s)", breakpoint.c_str());
+
+		return TextResult(text);
+	}
+
+	NDS_debug_armStepOver(cpu, returnAddress);
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
+
+	std::string text;
+	if (cpu.instruct_adr == returnAddress)
+		text = Format("stepped over the call at 0x%08X on ARM%d; PC=0x%08X",
+			(unsigned)from, (proc != 0) ? 7 : 9, (unsigned)cpu.instruct_adr);
+	else
+		text = Format("stepping over the call at 0x%08X on ARM%d did not come back to 0x%08X; PC=0x%08X",
+			(unsigned)from, (proc != 0) ? 7 : 9, (unsigned)returnAddress, (unsigned)cpu.instruct_adr);
+
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += Format(" (stopped on %s)", breakpoint.c_str());
+	else if (cpu.instruct_adr != returnAddress)
+		text += Format(" (gave up after %d frame(s))", ran);
+
+	return TextResult(text, cpu.instruct_adr != returnAddress && breakpoint.empty());
+}
+
+static std::string ToolStepOut(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+	const u32 from = cpu.instruct_adr;
+	const u32 startSP = cpu.R[13];
+
+	NDS_ClearBreakpointHit();
+
+	NDS_debug_armStepOut(cpu);
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
+
+	const bool returned = (cpu.R[13] > startSP);
+
+	std::string text;
+	if (returned)
+		text = Format("returned from 0x%08X to 0x%08X on ARM%d; SP 0x%08X -> 0x%08X",
+			(unsigned)from, (unsigned)cpu.instruct_adr, (proc != 0) ? 7 : 9,
+			(unsigned)startSP, (unsigned)cpu.R[13]);
+	else
+		text = Format("did not return from 0x%08X on ARM%d; PC=0x%08X SP=0x%08X",
+			(unsigned)from, (proc != 0) ? 7 : 9, (unsigned)cpu.instruct_adr, (unsigned)cpu.R[13]);
+
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += Format(" (stopped on %s)", breakpoint.c_str());
+	else if (!returned)
+		text += Format(" (gave up after %d frame(s))", ran);
+
+	return TextResult(text, !returned && breakpoint.empty());
 }
 
 static std::string ToolRunFrames(const mcpjson::Value &args)
@@ -1320,6 +1449,8 @@ static const char *TOOLS_JSON = R"json({"tools":[
 {"name":"nds_pause","description":"Pause emulation.","inputSchema":{"type":"object","properties":{}}},
 {"name":"nds_resume","description":"Resume emulation.","inputSchema":{"type":"object","properties":{}}},
 {"name":"nds_step","description":"Single step one CPU by a number of instructions.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"count":{"type":"integer","description":"Instructions to step, default 1, max 1000."}}}},
+{"name":"nds_step_over","description":"Step one instruction, running a function call or software interrupt to completion instead of stepping into it. Behaves like nds_step when the instruction is not a call.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"max_frames":{"type":"integer","description":"Give up if the call has not returned within this many frames, default 120."}}}},
+{"name":"nds_step_out","description":"Run until the function the CPU is in returns, that is until its stack frame is released and execution is back in the caller.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"max_frames":{"type":"integer","description":"Give up if the function has not returned within this many frames, default 120."}}}},
 {"name":"nds_run_frames","description":"Run a fixed number of video frames and then return. The emulator is advanced synchronously, which makes scripted play deterministic.","inputSchema":{"type":"object","properties":{"frames":{"type":"integer","description":"Frames to run, default 1, max 3600."}}}},
 {"name":"nds_reset","description":"Reset the NDS console.","inputSchema":{"type":"object","properties":{}}},
 {"name":"nds_quit","description":"Ask the emulator to shut down and exit.","inputSchema":{"type":"object","properties":{}}},
@@ -1373,6 +1504,8 @@ static std::string CallTool(const std::string &name, const mcpjson::Value &args)
 	if (name == "nds_pause")                  return ToolPause();
 	if (name == "nds_resume")                 return ToolResume();
 	if (name == "nds_step")                   return ToolStep(args);
+	if (name == "nds_step_over")              return ToolStepOver(args);
+	if (name == "nds_step_out")               return ToolStepOut(args);
 	if (name == "nds_run_frames")             return ToolRunFrames(args);
 	if (name == "nds_reset")                  return ToolReset();
 	if (name == "nds_quit")                   return ToolQuit();
