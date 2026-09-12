@@ -313,12 +313,14 @@ struct armcpu_t
 	armcpu_ctrl_iface ctrl_iface;
 
 	// debugging stuff
-	u32 stepOverBreak;
-	//a step over waits for stepOverBreak, a step out for the stack frame to be
-	//released; both only count when the CPU is back in the mode and the frame it
-	//was in when they were armed, so recursion and interrupts do not end them early
+	//A step over and a run to cursor wait for stepStopAddress, a step out for the
+	//stack frame to be released. stepSameFrame asks for the stop to happen in the
+	//mode and the frame the step was armed in, which is what keeps recursion and
+	//interrupts from ending it early; a run to cursor stops wherever it lands.
+	u32 stepStopAddress;
 	u32 stepSP;
 	u32 stepMode;
+	bool stepSameFrame;
 	bool steppingOut;
 	std::vector<u32> *breakPoints;
 	bool debugStep;

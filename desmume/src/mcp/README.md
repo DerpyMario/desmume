@@ -67,6 +67,7 @@ stream, `DELETE` with `204`, and CORS preflights are answered.
 | `nds_step` | Single step instructions (`count`) |
 | `nds_step_over` | Step one instruction, running a call or SWI to completion instead of into it |
 | `nds_step_out` | Run until the current function returns to its caller |
+| `nds_run_to_address` | Run to cursor: stop the moment execution reaches an address |
 | `nds_run_frames` | Run exactly N frames and return, which makes scripted play deterministic |
 | `nds_reset` | Reset the console |
 | `nds_quit` | Shut the emulator down |
@@ -99,6 +100,11 @@ within the code they are running through, so recursion and nested calls do not e
 them early, and both stop on a breakpoint if one is hit first and say so. Neither can
 run forever: `max_frames` (120 by default) bounds the wait, and they report it when
 they give up.
+
+`nds_run_to_address` is the run to cursor of a graphical debugger: it stops the first
+time execution reaches the address, from wherever it gets there, so it can be used to
+run into a function as well as out of one. It is one shot and leaves nothing behind,
+which is what makes it different from setting a breakpoint and clearing it again.
 
 A typical scripted interaction presses a button for a few frames and then looks at the
 result:

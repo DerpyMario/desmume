@@ -422,6 +422,10 @@ bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress);
 //Stop once execution reaches address in the frame it is in now. Cleared when it fires.
 void NDS_debug_armStepOver(armcpu_t &cpu, u32 address);
 
+//Run to cursor: stop once execution reaches address, in whatever frame or mode it
+//gets there. Cleared when it fires.
+void NDS_debug_armRunTo(armcpu_t &cpu, u32 address);
+
 //Stop once the stack frame the CPU is in now has been released, which is where the
 //function it is executing returns to its caller. Cleared when it fires.
 void NDS_debug_armStepOut(armcpu_t &cpu);

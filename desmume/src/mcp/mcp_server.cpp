@@ -617,6 +617,43 @@ static std::string ToolStepOver(const mcpjson::Value &args)
 	return TextResult(text, cpu.instruct_adr != returnAddress && breakpoint.empty());
 }
 
+static std::string ToolRunToAddress(const mcpjson::Value &args)
+{
+	if (!IsROMLoaded())
+		return ErrorResult("no ROM loaded");
+
+	u32 address = 0;
+	if (!args.GetAddress("address", address))
+		return ErrorResult("missing or malformed address");
+	if (address == 0)
+		return ErrorResult("address 0 cannot be run to");
+
+	armcpu_t &cpu = CPUFromArgs(args);
+	const int proc = ProcessorFromArgs(args);
+	const u32 from = cpu.instruct_adr;
+
+	NDS_ClearBreakpointHit();
+
+	NDS_debug_armRunTo(cpu, address);
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
+
+	const bool arrived = (cpu.instruct_adr == address);
+
+	std::string text;
+	if (arrived)
+		text = Format("ran from 0x%08X to 0x%08X on ARM%d", (unsigned)from, (unsigned)address, (proc != 0) ? 7 : 9);
+	else
+		text = Format("did not reach 0x%08X on ARM%d; PC=0x%08X", (unsigned)address, (proc != 0) ? 7 : 9, (unsigned)cpu.instruct_adr);
+
+	const std::string breakpoint = BreakpointHitDescription();
+	if (!breakpoint.empty())
+		text += Format(" (stopped on %s)", breakpoint.c_str());
+	else if (!arrived)
+		text += Format(" (gave up after %d frame(s))", ran);
+
+	return TextResult(text, !arrived && breakpoint.empty());
+}
+
 static std::string ToolStepOut(const mcpjson::Value &args)
 {
 	if (!IsROMLoaded())
@@ -1451,6 +1488,7 @@ static const char *TOOLS_JSON = R"json({"tools":[
 {"name":"nds_step","description":"Single step one CPU by a number of instructions.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"count":{"type":"integer","description":"Instructions to step, default 1, max 1000."}}}},
 {"name":"nds_step_over","description":"Step one instruction, running a function call or software interrupt to completion instead of stepping into it. Behaves like nds_step when the instruction is not a call.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"max_frames":{"type":"integer","description":"Give up if the call has not returned within this many frames, default 120."}}}},
 {"name":"nds_step_out","description":"Run until the function the CPU is in returns, that is until its stack frame is released and execution is back in the caller.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"max_frames":{"type":"integer","description":"Give up if the function has not returned within this many frames, default 120."}}}},
+{"name":"nds_run_to_address","description":"Run to cursor: resume and stop the moment execution reaches an address, wherever it gets there from. Unlike a breakpoint this is one shot and leaves nothing behind.","inputSchema":{"type":"object","properties":{"proc":{"type":"integer","description":"0 = ARM9 (default), 1 = ARM7."},"address":{"type":"string","description":"Address to run to, hex by default."},"max_frames":{"type":"integer","description":"Give up if the address has not been reached within this many frames, default 120."}},"required":["address"]}},
 {"name":"nds_run_frames","description":"Run a fixed number of video frames and then return. The emulator is advanced synchronously, which makes scripted play deterministic.","inputSchema":{"type":"object","properties":{"frames":{"type":"integer","description":"Frames to run, default 1, max 3600."}}}},
 {"name":"nds_reset","description":"Reset the NDS console.","inputSchema":{"type":"object","properties":{}}},
 {"name":"nds_quit","description":"Ask the emulator to shut down and exit.","inputSchema":{"type":"object","properties":{}}},
@@ -1506,6 +1544,7 @@ static std::string CallTool(const std::string &name, const mcpjson::Value &args)
 	if (name == "nds_step")                   return ToolStep(args);
 	if (name == "nds_step_over")              return ToolStepOver(args);
 	if (name == "nds_step_out")               return ToolStepOut(args);
+	if (name == "nds_run_to_address")         return ToolRunToAddress(args);
 	if (name == "nds_run_frames")             return ToolRunFrames(args);
 	if (name == "nds_reset")                  return ToolReset();
 	if (name == "nds_quit")                   return ToolQuit();
