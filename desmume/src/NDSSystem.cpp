@@ -2003,52 +2003,68 @@ bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress)
 
 void NDS_debug_armStepOver(armcpu_t &cpu, u32 address)
 {
-	cpu.stepOverBreak = address;
+	cpu.stepStopAddress = address;
 	cpu.stepSP = cpu.R[13];
 	cpu.stepMode = cpu.CPSR.bits.mode;
+	cpu.stepSameFrame = true;
+	cpu.steppingOut = false;
+}
+
+void NDS_debug_armRunTo(armcpu_t &cpu, u32 address)
+{
+	cpu.stepStopAddress = address;
+	cpu.stepSP = 0;
+	cpu.stepMode = 0;
+	//the cursor can sit anywhere, including inside a call or an interrupt handler
+	cpu.stepSameFrame = false;
 	cpu.steppingOut = false;
 }
 
 void NDS_debug_armStepOut(armcpu_t &cpu)
 {
-	cpu.stepOverBreak = 0;
+	cpu.stepStopAddress = 0;
 	cpu.stepSP = cpu.R[13];
 	cpu.stepMode = cpu.CPSR.bits.mode;
+	cpu.stepSameFrame = true;
 	cpu.steppingOut = true;
 }
 
 bool NDS_debug_isStepping(const armcpu_t &cpu)
 {
-	return (cpu.stepOverBreak != 0) || cpu.steppingOut;
+	return (cpu.stepStopAddress != 0) || cpu.steppingOut;
 }
 
 void NDS_debug_cancelStepping(armcpu_t &cpu)
 {
-	cpu.stepOverBreak = 0;
+	cpu.stepStopAddress = 0;
 	cpu.stepSP = 0;
+	cpu.stepSameFrame = false;
 	cpu.steppingOut = false;
 }
 
 /*
-	Ends a step over once execution is back at the address after the call, and a step
-	out once the stack frame it was armed in has been released. Both also require the
-	CPU to be in the mode they were armed in, so that an interrupt, which runs on its
-	own banked stack, cannot be mistaken for the function returning.
+	Ends a step over once execution is back at the address after the call, a run to
+	cursor once it reaches the address at all, and a step out once the stack frame the
+	step was armed in has been released.
+
+	The first and the last also require the CPU to be in the mode and the frame they
+	were armed in: a recursive call comes back to the same address on a deeper stack,
+	and an interrupt runs on its own banked stack, and neither should end the step.
 */
 static FORCEINLINE void CheckStepStop(armcpu_t &cpu)
 {
-	if (cpu.CPSR.bits.mode != cpu.stepMode)
-		return;
-
-	if (cpu.stepOverBreak != 0 && cpu.stepOverBreak == cpu.instruct_adr && cpu.R[13] >= cpu.stepSP)
+	if (cpu.stepStopAddress != 0 && cpu.stepStopAddress == cpu.instruct_adr)
 	{
-		//a recursive call reaches the same address with a deeper stack, hence the check
-		NDS_debug_cancelStepping(cpu);
-		execute = false;
-		return;
+		if (!cpu.stepSameFrame ||
+			(cpu.CPSR.bits.mode == cpu.stepMode && cpu.R[13] >= cpu.stepSP))
+		{
+			NDS_debug_cancelStepping(cpu);
+			execute = false;
+			return;
+		}
 	}
 
-	if (cpu.steppingOut && cpu.R[13] > cpu.stepSP)
+	if (cpu.steppingOut && cpu.CPSR.bits.mode == cpu.stepMode && cpu.R[13] > cpu.stepSP)
 	{
 		NDS_debug_cancelStepping(cpu);
 		execute = false;

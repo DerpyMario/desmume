@@ -243,9 +243,10 @@ void armcpu_init(armcpu_t *armcpu, u32 adr)
 	armcpu->intrWaitARM_state = 0;
 	armcpu->breakpointSkipAddress = ARMCPU_NO_BREAKPOINT_SKIP;
 	armcpu->debugStep = false;
-	armcpu->stepOverBreak = 0;
+	armcpu->stepStopAddress = 0;
 	armcpu->stepSP = 0;
 	armcpu->stepMode = 0;
+	armcpu->stepSameFrame = false;
 	armcpu->steppingOut = false;
 
 //#ifdef GDB_STUB
