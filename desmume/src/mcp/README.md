@@ -79,6 +79,9 @@ stream, `DELETE` with `204`, and CORS preflights are answered.
 | `nds_set_breakpoint` / `nds_clear_breakpoint` / `nds_clear_all_breakpoints` / `nds_list_breakpoints` | Execute, read and write breakpoints |
 | `nds_save_state` / `nds_load_state` | Savestates, to a file or a numbered slot |
 | `nds_screenshot` | PNG (or BMP) of both screens, the main screen or the touch screen; inline or written to a file |
+| `nds_dump_palette` | 256 colours as a `#RRGGBB` listing or a grid of swatches |
+| `nds_dump_tiles` | Character data decoded into a grid of 8x8 tiles, as an image |
+| `nds_dump_sprites` | An engine's object attribute memory, one line per sprite |
 | `nds_input_key` / `nds_input_touch` / `nds_input_release_all` | Buttons and touch screen, optionally held for a number of frames |
 
 Addresses are hex by default, so `"02000000"` and `"0x02000000"` mean the same thing.
@@ -119,6 +122,37 @@ time execution reaches the address, from wherever it gets there, so it can be us
 run into a function as well as out of one. It is one shot and leaves nothing behind,
 which is what makes it different from setting a breakpoint and clearing it again.
 
+## Looking at the graphics
+
+The three dump tools read what the 2D engines are drawing with, through the debug side
+of the MMU, so they see the VRAM bank mapping the game set up and disturb nothing.
+
+`nds_dump_palette` reads one of the four standard palettes — `engine` main or sub,
+`type` bg or obj — or any 256 colours you point `address` at. It answers with a
+listing by default, or a grid of swatches with `format: "image"` or a `.png` path.
+
+`nds_dump_tiles` decodes 8x8 character data into an image. Point it at a raw
+`address`, or name a background with `bg` and let the engine's own registers say
+where that layer's tiles live and how deep they are:
+
+```json
+{"name": "nds_dump_tiles", "arguments": {"bg": 0, "scale": 2, "path": "/tmp/bg0.png"}}
+```
+```
+192 8bpp tile(s) from 0x06010000 with the main engine bg palette,
+main engine BG0 (on, mode 0, 8bpp, tiles at 0x06010000, map at 0x06032000)
+```
+
+`nds_dump_sprites` lists an engine's object attribute memory, and heads the listing
+with where that engine keeps its sprite character data and how tile numbers step
+through it, which is what aims `nds_dump_tiles` at a particular sprite.
+
+Two things are worth knowing. Colour 0 is drawn as it is stored rather than as
+transparency, because a tile viewer wants to see it. And where an engine has extended
+palettes switched on, its colours come from VRAM rather than from palette memory: the
+tools say so rather than quietly colouring from the wrong place, and `palette_address`
+points the decoder at the colours you want.
+
 A typical scripted interaction presses a button for a few frames and then looks at the
 result:
 
@@ -133,6 +167,8 @@ result:
 | File | Role |
 | --- | --- |
 | `mcp_json.cpp` | Small JSON reader, so no new dependency is pulled into the core |
+| `mcp_image.cpp` | PNG and BMP encoding, and base64, for everything that returns a picture |
+| `mcp_gfx.cpp` | Reading palettes, character data and sprites out of the 2D engines |
 | `mcp_server.cpp` | Protocol handling and the tools themselves |
 | `mcp_http.cpp` | HTTP transport (Winsock on Windows, BSD sockets elsewhere) |
 

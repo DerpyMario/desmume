@@ -248,3 +248,5 @@ endif
 libdesmume_a_SOURCES += ../../mcp/mcp_server.cpp ../../mcp/mcp_server.h
 libdesmume_a_SOURCES += ../../mcp/mcp_http.cpp ../../mcp/mcp_http.h
 libdesmume_a_SOURCES += ../../mcp/mcp_json.cpp ../../mcp/mcp_json.h
+libdesmume_a_SOURCES += ../../mcp/mcp_image.cpp ../../mcp/mcp_image.h
+libdesmume_a_SOURCES += ../../mcp/mcp_gfx.cpp ../../mcp/mcp_gfx.h
