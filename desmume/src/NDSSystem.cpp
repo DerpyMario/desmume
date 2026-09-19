@@ -2001,11 +2001,22 @@ bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress)
 	return false;
 }
 
+u32 NDS_debug_getInstructionSize(const armcpu_t &cpu)
+{
+	if (!cpu.CPSR.bits.T)
+		return 4;
+
+	//BL and BLX immediate are a pair of halfwords that only make sense together
+	const u16 opcode = _MMU_read16((int)cpu.proc_ID, MMU_AT_DEBUG, cpu.instruct_adr);
+	return ((opcode & 0xF800) == 0xF000) ? 4 : 2;
+}
+
 void NDS_debug_armStepOver(armcpu_t &cpu, u32 address)
 {
 	cpu.stepStopAddress = address;
 	cpu.stepSP = cpu.R[13];
 	cpu.stepMode = cpu.CPSR.bits.mode;
+	cpu.stepReturn = 0;
 	cpu.stepSameFrame = true;
 	cpu.steppingOut = false;
 }
@@ -2015,6 +2026,7 @@ void NDS_debug_armRunTo(armcpu_t &cpu, u32 address)
 	cpu.stepStopAddress = address;
 	cpu.stepSP = 0;
 	cpu.stepMode = 0;
+	cpu.stepReturn = 0;
 	//the cursor can sit anywhere, including inside a call or an interrupt handler
 	cpu.stepSameFrame = false;
 	cpu.steppingOut = false;
@@ -2025,6 +2037,13 @@ void NDS_debug_armStepOut(armcpu_t &cpu)
 	cpu.stepStopAddress = 0;
 	cpu.stepSP = cpu.R[13];
 	cpu.stepMode = cpu.CPSR.bits.mode;
+	/*
+		A function that has not run its prologue yet, which is exactly where stepping
+		into a call leaves you, still has its return address in the link register and
+		pops back to the stack pointer it was entered with rather than past it. So
+		watch for that address as well as for the frame being released.
+	*/
+	cpu.stepReturn = cpu.R[14] & ~1u;
 	cpu.stepSameFrame = true;
 	cpu.steppingOut = true;
 }
@@ -2038,8 +2057,26 @@ void NDS_debug_cancelStepping(armcpu_t &cpu)
 {
 	cpu.stepStopAddress = 0;
 	cpu.stepSP = 0;
+	cpu.stepReturn = 0;
 	cpu.stepSameFrame = false;
 	cpu.steppingOut = false;
+}
+
+/*
+	The most a function's frame can plausibly be. Returning pops tens or hundreds of
+	bytes; a stack that moves further than this is a different stack, which is what an
+	interrupt handler runs on, and running one is not the function returning.
+*/
+static const u32 MAX_STACK_FRAME_SIZE = 0x10000;
+
+/* True when the CPU is back on the stack the step was armed on, no deeper than it was. */
+static FORCEINLINE bool IsInStepFrame(const armcpu_t &cpu)
+{
+	if (cpu.CPSR.bits.mode != cpu.stepMode)
+		return false;
+	if (cpu.R[13] < cpu.stepSP)
+		return false;  //deeper: a recursive call, or we are inside the callee
+	return (cpu.R[13] - cpu.stepSP) <= MAX_STACK_FRAME_SIZE;
 }
 
 /*
@@ -2047,16 +2084,15 @@ void NDS_debug_cancelStepping(armcpu_t &cpu)
 	cursor once it reaches the address at all, and a step out once the stack frame the
 	step was armed in has been released.
 
-	The first and the last also require the CPU to be in the mode and the frame they
-	were armed in: a recursive call comes back to the same address on a deeper stack,
-	and an interrupt runs on its own banked stack, and neither should end the step.
+	The first and the last also require the CPU to be back in the frame they were armed
+	in, so that a recursive call, which comes back to the same address on a deeper
+	stack, and an interrupt, which runs on a stack of its own, do not end the step.
 */
 static FORCEINLINE void CheckStepStop(armcpu_t &cpu)
 {
 	if (cpu.stepStopAddress != 0 && cpu.stepStopAddress == cpu.instruct_adr)
 	{
-		if (!cpu.stepSameFrame ||
-			(cpu.CPSR.bits.mode == cpu.stepMode && cpu.R[13] >= cpu.stepSP))
+		if (!cpu.stepSameFrame || IsInStepFrame(cpu))
 		{
 			NDS_debug_cancelStepping(cpu);
 			execute = false;
@@ -2064,10 +2100,16 @@ static FORCEINLINE void CheckStepStop(armcpu_t &cpu)
 		}
 	}
 
-	if (cpu.steppingOut && cpu.CPSR.bits.mode == cpu.stepMode && cpu.R[13] > cpu.stepSP)
+	if (cpu.steppingOut)
 	{
-		NDS_debug_cancelStepping(cpu);
-		execute = false;
+		const bool framePopped = (cpu.R[13] > cpu.stepSP);
+		const bool atReturnAddress = (cpu.stepReturn != 0 && cpu.instruct_adr == cpu.stepReturn);
+
+		if ((framePopped || atReturnAddress) && IsInStepFrame(cpu))
+		{
+			NDS_debug_cancelStepping(cpu);
+			execute = false;
+		}
 	}
 }
 

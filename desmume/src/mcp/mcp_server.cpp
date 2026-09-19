@@ -463,6 +463,13 @@ static std::string ToolResume()
 /* Shared by nds_step and by nds_step_over when it has nothing to step over. */
 static long StepInstructions(armcpu_t &cpu, long count)
 {
+	/*
+		The core counts a frame at the end of every NDS_exec(), and a step leaves it
+		after a single instruction, so stepping would otherwise run the frame counter
+		up one per instruction. A step is not a frame, so put the counter back.
+	*/
+	const int frameCounterBefore = currFrameCounter;
+
 	//a paused emulator has its CPUs stalled, which would keep them from executing
 	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
 	if (wasStalled)
@@ -476,18 +483,34 @@ static long StepInstructions(armcpu_t &cpu, long count)
 	long stepped = 0;
 	for (long i = 0; i < count; i++)
 	{
-		cpu.debugStep = true;
-		SetExecute(true);
+		/*
+			A THUMB BL is a pair of halfwords, and the CPU runs them as two
+			instructions. Stepping onto the second half would leave the debugger on
+			half a call, so run both and call it one step.
+		*/
+		int hardwareSteps = (NDS_debug_getInstructionSize(cpu) == 4 && cpu.CPSR.bits.T) ? 2 : 1;
+		bool ranAtAll = false;
 
-		NDS_exec<false>();
-		SPU_Emulate_user();
-
-		if (cpu.debugStep)
+		while (hardwareSteps-- > 0)
 		{
-			//the core never got to run: it is halted or waiting for an interrupt
-			cpu.debugStep = false;
-			break;
+			cpu.debugStep = true;
+			SetExecute(true);
+
+			NDS_exec<false>();
+			SPU_Emulate_user();
+
+			if (cpu.debugStep)
+			{
+				//the core never got to run: it is halted or waiting for an interrupt
+				cpu.debugStep = false;
+				break;
+			}
+
+			ranAtAll = true;
 		}
+
+		if (!ranAtAll)
+			break;
 
 		stepped++;
 	}
@@ -500,6 +523,8 @@ static long StepInstructions(armcpu_t &cpu, long count)
 		NDS_debug_break();
 	SetExecute(false);
 
+	currFrameCounter = frameCounterBefore;
+
 	return stepped;
 }
 
@@ -507,7 +532,7 @@ static long StepInstructions(armcpu_t &cpu, long count)
 	Runs until an armed step over or step out fires, a breakpoint stops us, or the
 	frame budget runs out. Returns the number of frames that ran.
 */
-static int RunUntilStepCompletes(armcpu_t &cpu, int maxFrames)
+static int RunUntilStepCompletes(armcpu_t &cpu, int maxFrames, bool &outCompleted)
 {
 	const bool wasStalled = (NDS_ARM9.stalled != 0 || NDS_ARM7.stalled != 0);
 	if (wasStalled)
@@ -525,6 +550,9 @@ static int RunUntilStepCompletes(armcpu_t &cpu, int maxFrames)
 		if (!execute)
 			break;  //the step finished, or a breakpoint stopped us
 	}
+
+	//the core clears the arming when it fires, which is what says the step finished
+	outCompleted = !NDS_debug_isStepping(cpu);
 
 	NDS_debug_cancelStepping(cpu);
 	if (wasStalled)
@@ -598,10 +626,11 @@ static std::string ToolStepOver(const mcpjson::Value &args)
 	}
 
 	NDS_debug_armStepOver(cpu, returnAddress);
-	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
+	bool completed = false;
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args), completed);
 
 	std::string text;
-	if (cpu.instruct_adr == returnAddress)
+	if (completed)
 		text = Format("stepped over the call at 0x%08X on ARM%d; PC=0x%08X",
 			(unsigned)from, (proc != 0) ? 7 : 9, (unsigned)cpu.instruct_adr);
 	else
@@ -611,10 +640,10 @@ static std::string ToolStepOver(const mcpjson::Value &args)
 	const std::string breakpoint = BreakpointHitDescription();
 	if (!breakpoint.empty())
 		text += Format(" (stopped on %s)", breakpoint.c_str());
-	else if (cpu.instruct_adr != returnAddress)
+	else if (!completed)
 		text += Format(" (gave up after %d frame(s))", ran);
 
-	return TextResult(text, cpu.instruct_adr != returnAddress && breakpoint.empty());
+	return TextResult(text, !completed && breakpoint.empty());
 }
 
 static std::string ToolRunToAddress(const mcpjson::Value &args)
@@ -635,9 +664,8 @@ static std::string ToolRunToAddress(const mcpjson::Value &args)
 	NDS_ClearBreakpointHit();
 
 	NDS_debug_armRunTo(cpu, address);
-	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
-
-	const bool arrived = (cpu.instruct_adr == address);
+	bool arrived = false;
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args), arrived);
 
 	std::string text;
 	if (arrived)
@@ -667,9 +695,8 @@ static std::string ToolStepOut(const mcpjson::Value &args)
 	NDS_ClearBreakpointHit();
 
 	NDS_debug_armStepOut(cpu);
-	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args));
-
-	const bool returned = (cpu.R[13] > startSP);
+	bool returned = false;
+	const int ran = RunUntilStepCompletes(cpu, StepFrameBudget(args), returned);
 
 	std::string text;
 	if (returned)

@@ -92,14 +92,27 @@ loop yields one iteration per resume.
 Reads and writes the debugger itself performs (`nds_read_memory`, `nds_write_memory`,
 `nds_search_memory`) never trip read or write breakpoints, only the emulated CPUs do.
 
+`nds_step` counts a THUMB `BL` as the one instruction it reads as, rather than
+stopping between its two halfwords, and stepping does not move the frame counter.
+
 `nds_step_over` looks at the instruction at the program counter: `BL`, `BLX`, and
 `SWI` (in ARM and in THUMB) are run to completion and execution stops on the
-instruction after them; anything else is an ordinary single step. `nds_step_out` runs
-until the stack frame the CPU is in has been released. Both ignore calls made from
-within the code they are running through, so recursion and nested calls do not end
-them early, and both stop on a breakpoint if one is hit first and say so. Neither can
-run forever: `max_frames` (120 by default) bounds the wait, and they report it when
-they give up.
+instruction after them; anything else is an ordinary single step.
+
+`nds_step_out` stops when the function returns, which it recognises either by the
+stack frame being released or by execution reaching the return address the link
+register held when the step was armed. The second is what makes stepping into a call
+and straight back out work: a function that has not run its prologue yet returns to
+the stack pointer it was entered with rather than past it. The flip side is that a
+step out armed in the middle of a function that loops around a call can stop where
+that call returns; step out again to leave the function.
+
+Both ignore calls made from within the code they are running through, so recursion
+and nested calls do not end them early, and a stack that moves by more than a frame's
+worth is taken for a different stack, so an interrupt handler is not mistaken for a
+return. Both stop on a breakpoint if one is hit first and say so. Neither can run
+forever: `max_frames` (120 by default) bounds the wait, and they report it when they
+give up.
 
 `nds_run_to_address` is the run to cursor of a graphical debugger: it stops the first
 time execution reaches the address, from wherever it gets there, so it can be used to

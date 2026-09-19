@@ -320,6 +320,7 @@ struct armcpu_t
 	u32 stepStopAddress;
 	u32 stepSP;
 	u32 stepMode;
+	u32 stepReturn;
 	bool stepSameFrame;
 	bool steppingOut;
 	std::vector<u32> *breakPoints;

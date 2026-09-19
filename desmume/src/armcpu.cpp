@@ -246,6 +246,7 @@ void armcpu_init(armcpu_t *armcpu, u32 adr)
 	armcpu->stepStopAddress = 0;
 	armcpu->stepSP = 0;
 	armcpu->stepMode = 0;
+	armcpu->stepReturn = 0;
 	armcpu->stepSameFrame = false;
 	armcpu->steppingOut = false;
 
