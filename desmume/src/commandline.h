@@ -89,6 +89,9 @@ public:
 	int enable_mcp;      /* 1 = expose the emulator through an MCP server */
 	int mcp_port;        /* >0 = serve MCP over HTTP on 127.0.0.1:port, 0 = stdio */
 	int headless;        /* 1 = run emulation without opening a window */
+	std::string dump_what;  /* non-empty = run, write these dumps and exit */
+	std::string dump_dir;   /* where the dumps go, default the working directory */
+	int dump_frames;        /* frames to run before dumping */
 	std::string cflash_image;
 	std::string cflash_path;
 	std::string gbaslot_rom;

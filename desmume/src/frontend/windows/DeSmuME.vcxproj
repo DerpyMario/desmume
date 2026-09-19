@@ -84,6 +84,7 @@
     <ClCompile Include="..\..\mcp\mcp_json.cpp" />
     <ClCompile Include="..\..\mcp\mcp_image.cpp" />
     <ClCompile Include="..\..\mcp\mcp_gfx.cpp" />
+    <ClCompile Include="..\..\mcp\mcp_dump.cpp" />
     <ClCompile Include="..\..\common.cpp" />
     <ClCompile Include="..\..\cp15.cpp" />
     <ClCompile Include="..\..\Database.cpp" />
@@ -415,6 +416,7 @@
     <ClInclude Include="..\..\mcp\mcp_json.h" />
     <ClInclude Include="..\..\mcp\mcp_image.h" />
     <ClInclude Include="..\..\mcp\mcp_gfx.h" />
+    <ClInclude Include="..\..\mcp\mcp_dump.h" />
     <ClInclude Include="..\..\arm_jit.h" />
     <ClInclude Include="..\..\bios.h" />
     <ClInclude Include="..\..\cheatSystem.h" />

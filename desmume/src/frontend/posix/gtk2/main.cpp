@@ -800,6 +800,11 @@ fill_configured_features( class configured_features *config,
     goto error;
   }
 
+  if (config->dump_what != "") {
+    g_printerr("Dumping runs without a window: use desmume-cli --dump.\n");
+    goto error;
+  }
+
   if (config->savetype < 0 || config->savetype > 6) {
     g_printerr("Accepted savetypes are from 0 to 6.\n");
     return false;

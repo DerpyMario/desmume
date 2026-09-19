@@ -316,6 +316,7 @@ if get_option('mcp')
     '../../mcp/mcp_json.cpp',
     '../../mcp/mcp_image.cpp',
     '../../mcp/mcp_gfx.cpp',
+    '../../mcp/mcp_dump.cpp',
     '../../mcp/mcp_server.cpp',
     '../../mcp/mcp_http.cpp',
   ]

@@ -49,8 +49,10 @@
 #include "../utils/xstring.h"
 #ifdef HAVE_MCP
 #include "../mcp/mcp_server.h"
+#include "../mcp/mcp_dump.h"
 #endif
 #include <signal.h>
+#include <vector>
 #include <time.h>
 
 #ifdef GDB_STUB
@@ -372,6 +374,8 @@ static bool headless_mode(class configured_features *config) {
   if (config->enable_mcp)
     return true;
 #endif
+  if (!config->dump_what.empty())
+    return true;
   return config->headless != 0;
 }
 
@@ -442,6 +446,56 @@ static bool mcp_stdio_requested(int argc, char **argv) {
   return stdio;
 }
 #endif
+
+/*
+ * --dump: run the ROM for a while so that there is something to look at, write the
+ * requested dumps out and exit. No window, no MCP, nothing interactive.
+ */
+static int run_dump(class configured_features *config) {
+#ifndef HAVE_MCP
+  (void)config;
+  fprintf(stderr, "dumping is not compiled into this build (meson -Dmcp=true)\n");
+  return 1;
+#else
+  u32 selection = 0;
+  std::string error;
+  if (!MCPDumpParseSelection(config->dump_what, selection, error)) {
+    fprintf(stderr, "%s\n", error.c_str());
+    return 1;
+  }
+
+  if (config->nds_file.empty()) {
+    fprintf(stderr, "no ROM to dump\n");
+    return 1;
+  }
+
+  if (NDS_LoadROM( config->nds_file.c_str()) < 0) {
+    fprintf(stderr, "error while loading %s\n", config->nds_file.c_str());
+    return 1;
+  }
+
+  if (config->load_slot != -1)
+    loadstate_slot(config->load_slot);
+
+  execute = true;
+  for (int frame = 0; frame < config->dump_frames; frame++) {
+    NDS_exec<false>();
+    SPU_Emulate_user();
+  }
+
+  std::vector<std::string> written;
+  if (!MCPDumpWrite(selection, config->dump_dir, written, error)) {
+    fprintf(stderr, "%s\n", error.c_str());
+    return 1;
+  }
+
+  printf("dumped at frame %d:\n", config->dump_frames);
+  for (size_t i = 0; i < written.size(); i++)
+    printf("  %s\n", written[i].c_str());
+
+  return 0;
+#endif
+}
 
 static int run_headless(class configured_features *config) {
   bool mcp_enabled = false;
@@ -671,7 +725,8 @@ int main(int argc, char ** argv) {
   backup_setManualBackupType(my_config.savetype);
 
   if (headless_mode(&my_config)) {
-    const int status = run_headless(&my_config);
+    const int status = my_config.dump_what.empty() ? run_headless(&my_config)
+                                                   : run_dump(&my_config);
 
     delete driver;
     driver = NULL;
