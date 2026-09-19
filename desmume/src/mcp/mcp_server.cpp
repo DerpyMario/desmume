@@ -16,7 +16,9 @@
 */
 
 #include "mcp_server.h"
+#include "mcp_gfx.h"
 #include "mcp_http.h"
+#include "mcp_image.h"
 #include "mcp_json.h"
 
 #include "../NDSSystem.h"
@@ -151,167 +153,6 @@ static std::string Format(const char *format, ...)
 	vsnprintf(&large[0], large.size(), format, args);
 	va_end(args);
 	return std::string(&large[0], (size_t)length);
-}
-
-//---------------------------------------------------------------------------
-// Image helpers
-//---------------------------------------------------------------------------
-
-static const char BASE64_TABLE[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static std::string Base64Encode(const u8 *data, size_t length)
-{
-	std::string out;
-	out.reserve(((length + 2) / 3) * 4);
-	for (size_t i = 0; i < length; i += 3)
-	{
-		unsigned int n = (unsigned int)data[i] << 16;
-		if (i + 1 < length) n |= (unsigned int)data[i + 1] << 8;
-		if (i + 2 < length) n |= (unsigned int)data[i + 2];
-		out.push_back(BASE64_TABLE[(n >> 18) & 63]);
-		out.push_back(BASE64_TABLE[(n >> 12) & 63]);
-		out.push_back((i + 1 < length) ? BASE64_TABLE[(n >> 6) & 63] : '=');
-		out.push_back((i + 2 < length) ? BASE64_TABLE[n & 63] : '=');
-	}
-	return out;
-}
-
-static void ConvertNative15ToRGB24(const u16 *src, u8 *dst, size_t pixelCount)
-{
-	for (size_t i = 0; i < pixelCount; i++)
-	{
-		const u16 pixel = src[i];
-		dst[i * 3 + 0] = (u8)(((pixel >> 0) & 0x1F) << 3);
-		dst[i * 3 + 1] = (u8)(((pixel >> 5) & 0x1F) << 3);
-		dst[i * 3 + 2] = (u8)(((pixel >> 10) & 0x1F) << 3);
-	}
-}
-
-static std::vector<u8> BuildBMP24(const u8 *rgb, int width, int height)
-{
-	const int rowStride = ((width * 3 + 3) / 4) * 4;
-	const int dataSize = rowStride * height;
-	const int fileSize = 54 + dataSize;
-	std::vector<u8> bmp((size_t)fileSize, 0);
-
-	bmp[0] = 'B';
-	bmp[1] = 'M';
-	*(u32 *)&bmp[2] = (u32)fileSize;
-	*(u32 *)&bmp[10] = 54;
-	*(u32 *)&bmp[14] = 40;
-	*(u32 *)&bmp[18] = (u32)width;
-	*(u32 *)&bmp[22] = (u32)height;
-	*(u16 *)&bmp[26] = 1;
-	*(u16 *)&bmp[28] = 24;
-	*(u32 *)&bmp[34] = (u32)dataSize;
-
-	u8 *dst = &bmp[54];
-	for (int y = height - 1; y >= 0; y--)
-	{
-		const u8 *srcRow = rgb + (size_t)y * (size_t)width * 3;
-		//BMP stores BGR
-		for (int x = 0; x < width; x++)
-		{
-			dst[x * 3 + 0] = srcRow[x * 3 + 2];
-			dst[x * 3 + 1] = srcRow[x * 3 + 1];
-			dst[x * 3 + 2] = srcRow[x * 3 + 0];
-		}
-		dst += width * 3;
-		for (int pad = rowStride - width * 3; pad > 0; pad--)
-			*dst++ = 0;
-	}
-
-	return bmp;
-}
-
-static void PNGAppendU32(std::vector<u8> &out, u32 value)
-{
-	out.push_back((u8)((value >> 24) & 0xFF));
-	out.push_back((u8)((value >> 16) & 0xFF));
-	out.push_back((u8)((value >> 8) & 0xFF));
-	out.push_back((u8)(value & 0xFF));
-}
-
-static void PNGAppendChunk(std::vector<u8> &out, const char *type, const u8 *data, size_t length)
-{
-	PNGAppendU32(out, (u32)length);
-
-	const size_t crcStart = out.size();
-	out.insert(out.end(), type, type + 4);
-	if (length > 0)
-		out.insert(out.end(), data, data + length);
-
-	uLong crc = crc32(0L, Z_NULL, 0);
-	crc = crc32(crc, &out[crcStart], (uInt)(4 + length));
-	PNGAppendU32(out, (u32)crc);
-}
-
-/* Returns an empty vector when compression fails. */
-static std::vector<u8> BuildPNG24(const u8 *rgb, int width, int height)
-{
-	std::vector<u8> png;
-
-	//raw scanlines, each prefixed with filter type 0
-	std::vector<u8> raw((size_t)height * ((size_t)width * 3 + 1));
-	for (int y = 0; y < height; y++)
-	{
-		u8 *row = &raw[(size_t)y * ((size_t)width * 3 + 1)];
-		row[0] = 0;
-		memcpy(row + 1, rgb + (size_t)y * (size_t)width * 3, (size_t)width * 3);
-	}
-
-	uLongf compressedSize = compressBound((uLong)raw.size());
-	std::vector<u8> compressed((size_t)compressedSize);
-	if (compress2(&compressed[0], &compressedSize, &raw[0], (uLong)raw.size(), Z_DEFAULT_COMPRESSION) != Z_OK)
-		return png;
-	compressed.resize((size_t)compressedSize);
-
-	static const u8 signature[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-	png.insert(png.end(), signature, signature + 8);
-
-	u8 ihdr[13];
-	ihdr[0] = (u8)((width >> 24) & 0xFF);
-	ihdr[1] = (u8)((width >> 16) & 0xFF);
-	ihdr[2] = (u8)((width >> 8) & 0xFF);
-	ihdr[3] = (u8)(width & 0xFF);
-	ihdr[4] = (u8)((height >> 24) & 0xFF);
-	ihdr[5] = (u8)((height >> 16) & 0xFF);
-	ihdr[6] = (u8)((height >> 8) & 0xFF);
-	ihdr[7] = (u8)(height & 0xFF);
-	ihdr[8] = 8;  //bit depth
-	ihdr[9] = 2;  //color type: truecolor
-	ihdr[10] = 0; //compression
-	ihdr[11] = 0; //filter
-	ihdr[12] = 0; //interlace
-	PNGAppendChunk(png, "IHDR", ihdr, sizeof(ihdr));
-	PNGAppendChunk(png, "IDAT", &compressed[0], compressed.size());
-	PNGAppendChunk(png, "IEND", NULL, 0);
-
-	return png;
-}
-
-static bool WriteFileBytes(const char *path, const u8 *data, size_t length)
-{
-	FILE *fp = fopen(path, "wb");
-	if (fp == NULL)
-		return false;
-	const size_t written = fwrite(data, 1, length, fp);
-	fclose(fp);
-	return (written == length);
-}
-
-static bool HasExtension(const std::string &path, const char *extension)
-{
-	const size_t extensionLength = strlen(extension);
-	if (path.size() < extensionLength)
-		return false;
-	for (size_t i = 0; i < extensionLength; i++)
-	{
-		const char a = (char)tolower((unsigned char)path[path.size() - extensionLength + i]);
-		if (a != extension[i])
-			return false;
-	}
-	return true;
 }
 
 //---------------------------------------------------------------------------
@@ -1346,6 +1187,238 @@ static std::string ToolScreenshot(const mcpjson::Value &args)
 }
 
 //---------------------------------------------------------------------------
+// Graphics
+//---------------------------------------------------------------------------
+
+/*
+	The image tools all answer the same way as nds_screenshot: written to path when one
+	is given, otherwise returned inline as a PNG.
+*/
+static std::string ImageResult(const std::vector<u8> &rgb, int width, int height,
+							   const std::string &path, const std::string &caption)
+{
+	if (rgb.empty())
+		return ErrorResult("nothing to draw");
+
+	const bool wantBMP = !path.empty() && HasExtension(path, ".bmp");
+	std::vector<u8> encoded = wantBMP ? BuildBMP24(&rgb[0], width, height)
+									  : BuildPNG24(&rgb[0], width, height);
+	if (encoded.empty())
+		return ErrorResult("failed to encode the image");
+
+	if (!path.empty())
+	{
+		if (!WriteFileBytes(path.c_str(), &encoded[0], encoded.size()))
+			return ErrorResult(Format("failed to write %s", path.c_str()));
+		return TextResult(Format("saved %dx%d %s of %s to %s", width, height,
+			wantBMP ? "BMP" : "PNG", caption.c_str(), path.c_str()));
+	}
+
+	std::string out("{\"content\":[{\"type\":\"image\",\"data\":\"");
+	out += Base64Encode(&encoded[0], encoded.size());
+	out += "\",\"mimeType\":\"";
+	out += wantBMP ? "image/bmp" : "image/png";
+	out += "\"},{\"type\":\"text\",\"text\":";
+	out += mcpjson::Quote(Format("%dx%d %s", width, height, caption.c_str()));
+	out += "}],\"isError\":false}";
+	return out;
+}
+
+/* Both palette readers and the tile viewer share this. */
+static bool PaletteFromArgs(const mcpjson::Value &args, MCPGfxEngine &engine,
+							MCPGfxPaletteType &type, std::string &outError)
+{
+	if (!MCPGfxParseEngine(args.GetString("engine"), engine))
+	{
+		outError = "engine must be main or sub";
+		return false;
+	}
+	if (!MCPGfxParsePaletteType(args.GetString("type"), type))
+	{
+		outError = "type must be bg or obj";
+		return false;
+	}
+	return true;
+}
+
+static std::string ToolDumpPalette(const mcpjson::Value &args)
+{
+	if (GPU == NULL)
+		return ErrorResult("GPU is not initialized");
+
+	MCPGfxEngine engine;
+	MCPGfxPaletteType type;
+	std::string error;
+	if (!PaletteFromArgs(args, engine, type, error))
+		return ErrorResult(error);
+
+	//an explicit address reads a palette that does not live in palette memory
+	u32 address = 0;
+	const bool hasAddress = args.GetAddress("address", address);
+	if (!hasAddress)
+		address = MCPGfxPaletteAddress(engine, type);
+
+	u16 colors[256];
+	MCPGfxReadPaletteAt(address, colors);
+
+	const std::string path = args.GetString("path");
+	std::string format = args.GetString("format");
+	if (format.empty())
+		format = (!path.empty() && (HasExtension(path, ".png") || HasExtension(path, ".bmp"))) ? "image" : "text";
+
+	const std::string caption = hasAddress
+		? Format("256 colours at 0x%08X", (unsigned)address)
+		: Format("the %s engine %s palette at 0x%08X",
+			MCPGfxEngineName(engine), MCPGfxPaletteTypeName(type), (unsigned)address);
+
+	if (format == "image" || format == "png" || format == "bmp")
+	{
+		int width = 0;
+		int height = 0;
+		const std::vector<u8> rgb = MCPGfxBuildPaletteImage(colors, (int)args.GetInt("cell", 8), width, height);
+		return ImageResult(rgb, width, height, path, caption);
+	}
+
+	if (format != "text")
+		return ErrorResult("format must be text or image");
+
+	const std::string listing = MCPGfxFormatPaletteText(colors);
+
+	if (!path.empty())
+	{
+		if (!WriteFileBytes(path.c_str(), (const u8 *)listing.c_str(), listing.size()))
+			return ErrorResult(Format("failed to write %s", path.c_str()));
+		return TextResult(Format("saved %s to %s", caption.c_str(), path.c_str()));
+	}
+
+	return TextResult(caption + "\n" + listing);
+}
+
+static std::string ToolDumpTiles(const mcpjson::Value &args)
+{
+	if (GPU == NULL)
+		return ErrorResult("GPU is not initialized");
+
+	MCPGfxEngine engine;
+	MCPGfxPaletteType type;
+	std::string error;
+	if (!PaletteFromArgs(args, engine, type, error))
+		return ErrorResult(error);
+
+	/*
+		Point the viewer either at a raw address or at one of the four backgrounds,
+		in which case the engine's own registers say where its tiles are and how deep
+		they are.
+	*/
+	u32 address = 0;
+	const bool hasAddress = args.GetAddress("address", address);
+	const mcpjson::Value *layerValue = args.Find("bg");
+	std::string source;
+	long layerDepth = 0;
+
+	if (layerValue != NULL && !layerValue->IsNull())
+	{
+		const int layer = (int)layerValue->AsInt();
+		MCPGfxBackgroundInfo info;
+		if (!MCPGfxGetBackgroundInfo(engine, layer, info))
+			return ErrorResult("bg must be 0, 1, 2 or 3");
+
+		if (!hasAddress)
+			address = info.characterBase;
+		layerDepth = info.bitsPerPixel;
+		source = Format("%s engine BG%d (%s, mode %d, %dbpp, tiles at 0x%08X, map at 0x%08X)",
+			MCPGfxEngineName(engine), layer, info.enabled ? "on" : "off", info.mode,
+			info.bitsPerPixel, (unsigned)info.characterBase, (unsigned)info.screenBase);
+	}
+	else if (!hasAddress)
+	{
+		return ErrorResult("give either an address or a bg layer number to dump");
+	}
+
+	//a layer's own colour depth is the default, unless the caller says otherwise
+	const long bitsPerPixel = args.GetInt("bpp", (layerDepth != 0) ? layerDepth : 4);
+	if (bitsPerPixel != 4 && bitsPerPixel != 8)
+		return ErrorResult("bpp must be 4 or 8");
+
+	long tiles = args.GetInt("count", 256);
+	if (tiles < 1) tiles = 1;
+	if (tiles > 4096) tiles = 4096;
+
+	long columns = args.GetInt("columns", 16);
+	if (columns < 1) columns = 1;
+	if (columns > 64) columns = 64;
+
+	long scale = args.GetInt("scale", 1);
+	if (scale < 1) scale = 1;
+	if (scale > 8) scale = 8;
+
+	u32 paletteAddress = 0;
+	const bool hasPaletteAddress = args.GetAddress("palette_address", paletteAddress);
+
+	u16 colors[256];
+	if (hasPaletteAddress)
+		MCPGfxReadPaletteAt(paletteAddress, colors);
+	else
+		MCPGfxReadPalette(engine, type, colors);
+
+	int width = 0;
+	int height = 0;
+	const std::vector<u8> rgb = MCPGfxBuildTileImage(address, (int)tiles, (int)bitsPerPixel, colors,
+		(int)args.GetInt("palette", 0), (int)columns, (int)scale, width, height);
+
+	std::string caption = hasPaletteAddress
+		? Format("%ld %ldbpp tile(s) from 0x%08X coloured from 0x%08X",
+			tiles, bitsPerPixel, (unsigned)address, (unsigned)paletteAddress)
+		: Format("%ld %ldbpp tile(s) from 0x%08X with the %s engine %s palette",
+			tiles, bitsPerPixel, (unsigned)address, MCPGfxEngineName(engine), MCPGfxPaletteTypeName(type));
+	if (!source.empty())
+		caption += ", " + source;
+
+	/*
+		Extended palettes live in VRAM rather than in palette memory, so colouring
+		from palette memory would be a guess. Say so instead of quietly being wrong.
+	*/
+	if (!hasPaletteAddress)
+	{
+		bool extended = false;
+		if (type == MCP_GFX_PALETTE_OBJ)
+		{
+			MCPGfxObjectInfo objectInfo;
+			MCPGfxGetObjectInfo(engine, objectInfo);
+			extended = objectInfo.extendedPalettes;
+		}
+		else
+		{
+			MCPGfxBackgroundInfo info;
+			if (MCPGfxGetBackgroundInfo(engine, 0, info))
+				extended = info.extendedPalettes;
+		}
+
+		if (extended)
+			caption += "; this engine has extended palettes on, so these colours are only the standard palette, pass palette_address to colour from elsewhere";
+	}
+
+	return ImageResult(rgb, width, height, args.GetString("path"), caption);
+}
+
+static std::string ToolDumpSprites(const mcpjson::Value &args)
+{
+	if (GPU == NULL)
+		return ErrorResult("GPU is not initialized");
+
+	MCPGfxEngine engine;
+	if (!MCPGfxParseEngine(args.GetString("engine"), engine))
+		return ErrorResult("engine must be main or sub");
+
+	int shown = 0;
+	const std::string listing = MCPGfxFormatOAMText(engine,
+		args.GetBool("only_visible", true), (int)args.GetInt("max", 128), shown);
+
+	return TextResult(Format("%d sprite(s) in the %s engine object attribute memory\n",
+		shown, MCPGfxEngineName(engine)) + listing);
+}
+
+//---------------------------------------------------------------------------
 // Input
 //---------------------------------------------------------------------------
 
@@ -1535,6 +1608,9 @@ static const char *TOOLS_JSON = R"json({"tools":[
 {"name":"nds_save_state","description":"Write a savestate to a file or to a numbered slot.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Destination file. Takes precedence over slot."},"slot":{"type":"integer","description":"Savestate slot, 0-9."}}}},
 {"name":"nds_load_state","description":"Restore a savestate from a file or from a numbered slot.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Source file. Takes precedence over slot."},"slot":{"type":"integer","description":"Savestate slot, 0-9."}}}},
 {"name":"nds_screenshot","description":"Capture the current display. Returns the image inline unless a path is given.","inputSchema":{"type":"object","properties":{"screen":{"type":"string","description":"both (default), main or touch."},"path":{"type":"string","description":"Write the image to this file instead of returning it inline."},"format":{"type":"string","description":"png (default) or bmp. An explicit .png/.bmp extension in path wins."}}}},
+{"name":"nds_dump_palette","description":"Dump 256 colours, as a listing of #RRGGBB values or as a grid of swatches. Reads one of the four standard palettes, or any address you point it at.","inputSchema":{"type":"object","properties":{"engine":{"type":"string","description":"main (default) or sub."},"type":{"type":"string","description":"bg (default) or obj."},"address":{"type":"string","description":"Read 256 colours from here instead, hex by default."},"format":{"type":"string","description":"text (default) or image. A .png or .bmp path implies image."},"cell":{"type":"integer","description":"Swatch size in pixels for the image, default 8."},"path":{"type":"string","description":"Write to this file instead of returning it."}}}},
+{"name":"nds_dump_tiles","description":"Decode character data into a grid of 8x8 tiles and return it as an image. Point it at a raw address, or at a background layer and let the engine's registers say where its tiles are and how deep they are. Reads through the VRAM mapping the game set up.","inputSchema":{"type":"object","properties":{"address":{"type":"string","description":"Where the tiles start, hex by default (e.g. 06000000). Either this or bg."},"bg":{"type":"integer","description":"Dump the character data of this background, 0-3, taking its address and colour depth from the engine."},"count":{"type":"integer","description":"Tiles to decode, default 256, max 4096."},"bpp":{"type":"integer","description":"4 (default) or 8 bits per pixel."},"palette":{"type":"integer","description":"Which 16 colour slice 4bpp tiles use, 0-15, default 0."},"engine":{"type":"string","description":"Palette to colour them with: main (default) or sub."},"type":{"type":"string","description":"Palette to colour them with: bg (default) or obj."},"columns":{"type":"integer","description":"Tiles per row, default 16."},"scale":{"type":"integer","description":"Pixel zoom, 1-8, default 1."},"palette_address":{"type":"string","description":"Colour the tiles from 256 colours at this address instead of from the engine's palette, which is how to read graphics that use extended palettes."},"path":{"type":"string","description":"Write to this file instead of returning it."}}}},
+{"name":"nds_dump_sprites","description":"List an engine's object attribute memory: position, size, tile, palette, priority and flags for each sprite.","inputSchema":{"type":"object","properties":{"engine":{"type":"string","description":"main (default) or sub."},"only_visible":{"type":"boolean","description":"Skip disabled sprites, default true."},"max":{"type":"integer","description":"How many of the 128 entries to look at, default 128."}}}},
 {"name":"nds_input_key","description":"Press or release a DS button, optionally holding it for a number of frames.","inputSchema":{"type":"object","properties":{"button":{"type":"string","description":"A, B, X, Y, start, select, up, down, left, right, L, R, debug or lid."},"pressed":{"type":"boolean","description":"true to press (default), false to release."},"frames":{"type":"integer","description":"Hold for this many frames, run them, then release. Default 0 (latch)."}},"required":["button"]}},
 {"name":"nds_input_touch","description":"Touch the bottom screen, optionally holding the touch for a number of frames.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","description":"0-255."},"y":{"type":"integer","description":"0-191."},"touch":{"type":"boolean","description":"true to touch (default), false to release."},"frames":{"type":"integer","description":"Hold for this many frames, run them, then release. Default 0 (latch)."}}}},
 {"name":"nds_input_release_all","description":"Release every button and the touch screen.","inputSchema":{"type":"object","properties":{}}}
@@ -1591,6 +1667,9 @@ static std::string CallTool(const std::string &name, const mcpjson::Value &args)
 	if (name == "nds_save_state")             return ToolSaveState(args);
 	if (name == "nds_load_state")             return ToolLoadState(args);
 	if (name == "nds_screenshot")             return ToolScreenshot(args);
+	if (name == "nds_dump_palette")           return ToolDumpPalette(args);
+	if (name == "nds_dump_tiles")             return ToolDumpTiles(args);
+	if (name == "nds_dump_sprites")           return ToolDumpSprites(args);
 	if (name == "nds_input_key")              return ToolInputKey(args);
 	if (name == "nds_input_touch")            return ToolInputTouch(args);
 	if (name == "nds_input_release_all")      return ToolInputReleaseAll();

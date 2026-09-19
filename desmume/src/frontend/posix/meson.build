@@ -314,6 +314,8 @@ if get_option('mcp')
   add_global_arguments('-DHAVE_MCP', language: ['c', 'cpp'])
   libdesmume_src += [
     '../../mcp/mcp_json.cpp',
+    '../../mcp/mcp_image.cpp',
+    '../../mcp/mcp_gfx.cpp',
     '../../mcp/mcp_server.cpp',
     '../../mcp/mcp_http.cpp',
   ]
