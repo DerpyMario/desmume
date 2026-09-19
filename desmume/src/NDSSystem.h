@@ -419,6 +419,10 @@ struct armcpu_t;
 //into. outReturnAddress is where execution comes back to.
 bool NDS_debug_getStepOverTarget(const armcpu_t &cpu, u32 &outReturnAddress);
 
+//Length in bytes of the instruction at the CPU's program counter. A THUMB BL or BLX
+//immediate is a pair of halfwords, and counts as the single instruction it is.
+u32 NDS_debug_getInstructionSize(const armcpu_t &cpu);
+
 //Stop once execution reaches address in the frame it is in now. Cleared when it fires.
 void NDS_debug_armStepOver(armcpu_t &cpu, u32 address);
 
