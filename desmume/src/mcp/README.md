@@ -147,6 +147,20 @@ main engine BG0 (on, mode 0, 8bpp, tiles at 0x06010000, map at 0x06032000)
 with where that engine keeps its sprite character data and how tile numbers step
 through it, which is what aims `nds_dump_tiles` at a particular sprite.
 
+The same content is available without a client at all. `--dump` runs the ROM for a
+while, writes the dumps and exits:
+
+```sh
+desmume-cli --dump all --dump-frames 700 --dump-dir shots game.nds
+```
+
+`--dump` takes any of `screen`, `palette`, `tiles`, `sprites` and `all`. It writes
+`screen.png`, a swatch image per palette plus `palettes.txt`, a tile sheet per
+background and per object engine, and `sprites.txt`. `--dump-frames` is how long to
+run first and defaults to 60, which is rarely enough: most games need a few hundred
+frames to get past their boot screens. `--dump-dir` has to exist. Dumping implies
+`--headless`, and it cannot be combined with `--mcp`, which serves rather than exits.
+
 Two things are worth knowing. Colour 0 is drawn as it is stored rather than as
 transparency, because a tile viewer wants to see it. And where an engine has extended
 palettes switched on, its colours come from VRAM rather than from palette memory: the
@@ -169,6 +183,7 @@ result:
 | `mcp_json.cpp` | Small JSON reader, so no new dependency is pulled into the core |
 | `mcp_image.cpp` | PNG and BMP encoding, and base64, for everything that returns a picture |
 | `mcp_gfx.cpp` | Reading palettes, character data and sprites out of the 2D engines |
+| `mcp_dump.cpp` | The same content written out as files, for the `--dump` command line |
 | `mcp_server.cpp` | Protocol handling and the tools themselves |
 | `mcp_http.cpp` | HTTP transport (Winsock on Windows, BSD sockets elsewhere) |
 

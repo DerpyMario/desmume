@@ -138,6 +138,13 @@ ENDL
 " --headless                 Run emulation without opening a window" ENDL
 "                            (implied by --mcp)" ENDL
 ENDL
+"Arguments for dumping what the 2D engines are drawing, then exiting:" ENDL
+" --dump WHAT[,WHAT...]      Run the ROM, write these dumps and exit. WHAT is any of" ENDL
+"                            screen, palette, tiles, sprites, or all" ENDL
+" --dump-frames N            Frames to run before dumping (default 60). Most games" ENDL
+"                            need a few hundred to get past their boot screens" ENDL
+" --dump-dir DIR             Where to write them (default the working directory)" ENDL
+ENDL
 "Utility commands which occur in place of emulation:" ENDL
 " --advanscene-import PATH   Import advanscene, dump .ddb, and exit" ENDL
 ENDL
@@ -183,6 +190,9 @@ ENDL
 #define OPT_MCP 702
 #define OPT_MCP_PORT 703
 #define OPT_HEADLESS 704
+#define OPT_DUMP 705
+#define OPT_DUMP_DIR 706
+#define OPT_DUMP_FRAMES 707
 
 #define OPT_RTC_DAY 800
 #define OPT_RTC_HOUR 801
@@ -239,6 +249,9 @@ CommandLine::CommandLine()
 	enable_mcp                = 0;
 	mcp_port                  = 0;
 	headless                  = 0;
+	dump_what                 = "";
+	dump_dir                  = "";
+	dump_frames               = 60;
 	cflash_image              = "";
 	cflash_path               = "";
 	gbaslot_rom               = "";
@@ -348,6 +361,9 @@ bool CommandLine::parse(int argc,char **argv)
 			{ "mcp", no_argument, NULL, OPT_MCP},
 			{ "mcp-port", required_argument, NULL, OPT_MCP_PORT},
 			{ "headless", no_argument, NULL, OPT_HEADLESS},
+			{ "dump", required_argument, NULL, OPT_DUMP},
+			{ "dump-dir", required_argument, NULL, OPT_DUMP_DIR},
+			{ "dump-frames", required_argument, NULL, OPT_DUMP_FRAMES},
 
 			//utilities
 			{ "advanscene-import", required_argument, NULL, OPT_ADVANSCENE},
@@ -415,6 +431,9 @@ bool CommandLine::parse(int argc,char **argv)
 		case OPT_MCP: enable_mcp = 1; break;
 		case OPT_MCP_PORT: enable_mcp = 1; mcp_port = atoi(optarg); break;
 		case OPT_HEADLESS: headless = 1; break;
+		case OPT_DUMP: dump_what = optarg; break;
+		case OPT_DUMP_DIR: dump_dir = optarg; break;
+		case OPT_DUMP_FRAMES: dump_frames = atoi(optarg); break;
 
 		//utilities
 		case OPT_ADVANSCENE: CommonSettings.run_advanscene_import = optarg; break;
@@ -527,6 +546,16 @@ bool CommandLine::validate()
 
 	if (mcp_port != 0 && (mcp_port < 1 || mcp_port > 65535)) {
 		printerror("MCP port must be in the range 1 to 65535.\n");
+		return false;
+	}
+
+	if (dump_what != "" && enable_mcp) {
+		printerror("Cannot both dump and serve MCP: --dump runs the ROM and exits.\n");
+		return false;
+	}
+
+	if (dump_frames < 0) {
+		printerror("Frames to run before dumping cannot be negative.\n");
 		return false;
 	}
 
